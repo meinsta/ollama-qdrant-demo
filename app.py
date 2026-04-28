@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -20,6 +24,19 @@ DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 DEFAULT_EMBED_MODEL = os.getenv("OLLAMA_MODEL", "nomic-embed-text")
 DEFAULT_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2")
+
+# Chunking defaults. Word-based windowing keeps the demo dependency-light
+# (no tokenizer required) while still producing reasonable chunks for the
+# default embedding model.
+DEFAULT_CHUNK_WORDS = 400
+DEFAULT_CHUNK_OVERLAP = 50
+
+# Stable namespace for deterministic point IDs derived from (source, chunk_index).
+# Re-ingesting the same source+chunk_index overwrites the previous point.
+_POINT_ID_NAMESPACE = uuid.UUID("6f1d2c3a-9b0e-4a8e-9f31-1c2b3d4e5f60")
+
+SUPPORTED_FILE_SUFFIXES = {".pdf", ".txt", ".md", ".markdown"}
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file; demo guardrail.
 
 
 class ChatRequest(BaseModel):
@@ -146,6 +163,358 @@ def format_preview(text: str, max_length: int = 120) -> str:
     return f"{cleaned[: max_length - 3]}..."
 
 
+# ---------------------------------------------------------------------------
+# Extraction + chunking pipeline
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Chunk:
+    """A single chunk of text ready to be embedded and upserted."""
+
+    text: str
+    chunk_index: int
+    char_start: int
+    char_end: int
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    chunk_count: int = 0  # populated once the full chunk list is known
+
+
+@dataclass
+class IngestReport:
+    """Summary of an ingest operation for a single source."""
+
+    source: str
+    title: str
+    source_type: str
+    chunks_ingested: int
+    pages: Optional[int] = None
+    skipped_reason: Optional[str] = None
+
+
+def extract_pdf_pages(data: bytes) -> List[Tuple[int, str]]:
+    """Extract per-page text from a PDF byte string. Pages are 1-indexed."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:  # pragma: no cover - dependency hint
+        raise RuntimeError(
+            "pypdf is required for PDF ingestion. Install dependencies with "
+            "'pip install -r requirements.txt'."
+        ) from exc
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except Exception as exc:
+        raise ValueError(f"Could not parse PDF: {exc}") from exc
+
+    pages: List[Tuple[int, str]] = []
+    for index, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        pages.append((index, text))
+    return pages
+
+
+def _words_with_pages_from_text(text: str) -> List[Tuple[str, Optional[int]]]:
+    return [(token, None) for token in text.split()]
+
+
+def _words_with_pages_from_pdf(
+    pages: Sequence[Tuple[int, str]],
+) -> List[Tuple[str, Optional[int]]]:
+    out: List[Tuple[str, Optional[int]]] = []
+    for page_number, page_text in pages:
+        for token in page_text.split():
+            out.append((token, page_number))
+    return out
+
+
+def chunk_words(
+    words_with_pages: Sequence[Tuple[str, Optional[int]]],
+    *,
+    chunk_size: int = DEFAULT_CHUNK_WORDS,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> List[Chunk]:
+    """Split a token stream into overlapping windows.
+
+    The token stream pairs each whitespace-delimited token with an optional
+    page number (used for PDFs). Char offsets are computed against the joined
+    " ".join(...) representation so they line up with the chunk text we store.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must satisfy 0 <= overlap < chunk_size")
+
+    total_words = len(words_with_pages)
+    if total_words == 0:
+        return []
+
+    word_strings = [w for w, _ in words_with_pages]
+    page_per_word = [p for _, p in words_with_pages]
+
+    # Char offset of each word in the eventual joined text (single-space separator).
+    char_offsets: List[int] = []
+    cursor = 0
+    for word in word_strings:
+        char_offsets.append(cursor)
+        cursor += len(word) + 1  # word + separating space
+
+    step = chunk_size - chunk_overlap
+    chunks: List[Chunk] = []
+    start = 0
+    while start < total_words:
+        end = min(start + chunk_size, total_words)
+        text = " ".join(word_strings[start:end])
+        char_start = char_offsets[start]
+        char_end = char_offsets[end - 1] + len(word_strings[end - 1])
+        sub_pages = [p for p in page_per_word[start:end] if p is not None]
+        page_start = min(sub_pages) if sub_pages else None
+        page_end = max(sub_pages) if sub_pages else None
+        chunks.append(
+            Chunk(
+                text=text,
+                chunk_index=len(chunks),
+                char_start=char_start,
+                char_end=char_end,
+                page_start=page_start,
+                page_end=page_end,
+            )
+        )
+        if end == total_words:
+            break
+        start += step
+
+    total_chunks = len(chunks)
+    for chunk in chunks:
+        chunk.chunk_count = total_chunks
+    return chunks
+
+
+def extract_chunks_from_bytes(
+    *,
+    filename: str,
+    data: bytes,
+    chunk_size: int = DEFAULT_CHUNK_WORDS,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> Tuple[List[Chunk], str, Optional[int]]:
+    """Parse raw bytes by file extension and return chunks plus source_type.
+
+    Returns (chunks, source_type, page_count). page_count is only set for PDFs.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_FILE_SUFFIXES:
+        raise ValueError(
+            f"Unsupported file type '{suffix or '(none)'}'. Supported: "
+            f"{sorted(SUPPORTED_FILE_SUFFIXES)}"
+        )
+
+    page_count: Optional[int] = None
+    if suffix == ".pdf":
+        pages = extract_pdf_pages(data)
+        page_count = len(pages)
+        words = _words_with_pages_from_pdf(pages)
+        source_type = "pdf"
+    elif suffix in (".md", ".markdown"):
+        text = data.decode("utf-8", errors="replace")
+        words = _words_with_pages_from_text(text)
+        source_type = "markdown"
+    else:  # .txt
+        text = data.decode("utf-8", errors="replace")
+        words = _words_with_pages_from_text(text)
+        source_type = "text"
+
+    chunks = chunk_words(words, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return chunks, source_type, page_count
+
+
+# ---------------------------------------------------------------------------
+# Shared ingest pipeline (used by CLI and HTTP endpoints)
+# ---------------------------------------------------------------------------
+
+
+def _deterministic_point_id(source: str, chunk_index: int) -> str:
+    return str(uuid.uuid5(_POINT_ID_NAMESPACE, f"{source}#{chunk_index}"))
+
+
+def ensure_collection(
+    client: QdrantClient, collection: str, vector_size: int
+) -> None:
+    """Create the collection if missing; verify vector size if it already exists."""
+    if client.collection_exists(collection):
+        info = client.get_collection(collection)
+        existing_size: Optional[int] = None
+        try:
+            vectors_cfg = info.config.params.vectors
+            existing_size = getattr(vectors_cfg, "size", None)
+        except AttributeError:
+            existing_size = None
+        if existing_size is not None and existing_size != vector_size:
+            raise RuntimeError(
+                f"Collection '{collection}' was created with vector size "
+                f"{existing_size}, but the current embedding model produces "
+                f"vectors of size {vector_size}. Drop the collection or pick a "
+                "matching model before ingesting."
+            )
+        return
+
+    client.create_collection(
+        collection_name=collection,
+        vectors_config=models.VectorParams(
+            size=vector_size, distance=models.Distance.COSINE
+        ),
+    )
+
+
+def _delete_chunks_by_source(
+    client: QdrantClient, collection: str, source: str
+) -> None:
+    if not client.collection_exists(collection):
+        return
+    client.delete(
+        collection_name=collection,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="source", match=models.MatchValue(value=source)
+                    )
+                ]
+            )
+        ),
+    )
+
+
+def ingest_chunks(
+    *,
+    client: QdrantClient,
+    collection: str,
+    embed_model: str,
+    ollama_url: str,
+    title: str,
+    source: str,
+    source_type: str,
+    category: str,
+    tags: Sequence[str],
+    chunks: Sequence[Chunk],
+    replace_existing: bool,
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Embed chunks via Ollama and upsert them into Qdrant with rich payload.
+
+    Returns the number of points successfully upserted.
+    """
+    if not chunks:
+        return 0
+
+    # Probe vector size from the first chunk so we can lazily create the
+    # collection on the very first ingest call.
+    first_vector = get_embedding(chunks[0].text, embed_model, ollama_url)
+    ensure_collection(client, collection, len(first_vector))
+
+    if replace_existing:
+        _delete_chunks_by_source(client, collection, source)
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    tag_list = [str(t) for t in (tags or [])]
+    points: List[models.PointStruct] = []
+    for idx, chunk in enumerate(chunks):
+        vector = first_vector if idx == 0 else get_embedding(
+            chunk.text, embed_model, ollama_url
+        )
+        payload: Dict[str, Any] = {
+            "title": title,
+            "text": chunk.text,
+            "category": category,
+            "source": source,
+            "source_type": source_type,
+            "chunk_index": chunk.chunk_index,
+            "chunk_count": chunk.chunk_count,
+            "char_start": chunk.char_start,
+            "char_end": chunk.char_end,
+            "tags": tag_list,
+            "created_at": created_at,
+        }
+        if chunk.page_start is not None:
+            payload["page_start"] = chunk.page_start
+            payload["page_end"] = chunk.page_end
+        if extra_payload:
+            payload.update(extra_payload)
+        points.append(
+            models.PointStruct(
+                id=_deterministic_point_id(source, chunk.chunk_index),
+                vector=vector,
+                payload=payload,
+            )
+        )
+
+    client.upsert(collection_name=collection, points=points)
+    return len(points)
+
+
+def ingest_bytes(
+    *,
+    client: QdrantClient,
+    collection: str,
+    embed_model: str,
+    ollama_url: str,
+    filename: str,
+    data: bytes,
+    category: str,
+    tags: Sequence[str],
+    replace_existing: bool,
+    chunk_size: int = DEFAULT_CHUNK_WORDS,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> IngestReport:
+    """Top-level helper: bytes -> chunks -> embed -> upsert. Used by HTTP + CLI."""
+    chunks, source_type, page_count = extract_chunks_from_bytes(
+        filename=filename,
+        data=data,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    title = Path(filename).stem or filename
+    source = Path(filename).name or filename
+
+    if not chunks:
+        return IngestReport(
+            source=source,
+            title=title,
+            source_type=source_type,
+            chunks_ingested=0,
+            pages=page_count,
+            skipped_reason=(
+                "No extractable text found. Scanned PDFs require OCR before "
+                "ingestion."
+            ),
+        )
+
+    ingested = ingest_chunks(
+        client=client,
+        collection=collection,
+        embed_model=embed_model,
+        ollama_url=ollama_url,
+        title=title,
+        source=source,
+        source_type=source_type,
+        category=category,
+        tags=tags,
+        chunks=chunks,
+        replace_existing=replace_existing,
+        extra_payload={"page_count": page_count} if page_count is not None else None,
+    )
+    return IngestReport(
+        source=source,
+        title=title,
+        source_type=source_type,
+        chunks_ingested=ingested,
+        pages=page_count,
+    )
+
+
 def search_documents(
     query: str,
     *,
@@ -190,45 +559,105 @@ def build_rag_prompt(message: str, contexts: List[Dict[str, Any]]) -> str:
 
 
 def ingest_documents(args: argparse.Namespace) -> None:
+    """Ingest the bundled JSON sample data through the unified chunk pipeline.
+
+    The collection is dropped and recreated to mirror the original behavior:
+    'ingest' is a clean-slate command for the canned sample dataset.
+    """
     documents = load_documents(Path(args.data_file))
     if not documents:
         raise ValueError("No documents to ingest")
 
     client = QdrantClient(url=args.qdrant_url)
-    probe_text = f"{documents[0]['title']}\n{documents[0]['text']}"
-    probe_vector = get_embedding(probe_text, args.model, args.ollama_url)
-
     if client.collection_exists(args.collection):
         client.delete_collection(args.collection)
 
-    client.create_collection(
-        collection_name=args.collection,
-        vectors_config=models.VectorParams(
-            size=len(probe_vector), distance=models.Distance.COSINE
-        ),
-    )
-
-    points: List[models.PointStruct] = []
+    total_chunks = 0
     for doc in documents:
-        text_for_embedding = f"{doc['title']}\n{doc['text']}"
-        vector = get_embedding(text_for_embedding, args.model, args.ollama_url)
-        payload = {
-            "title": doc["title"],
-            "text": doc["text"],
-            "category": doc["category"],
-        }
-        points.append(
-            models.PointStruct(
-                id=doc["id"],
-                vector=vector,
-                payload=payload,
-            )
+        body = f"{doc['title']}\n{doc['text']}"
+        words = _words_with_pages_from_text(body)
+        chunks = chunk_words(
+            words,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+        )
+        if not chunks:
+            continue
+        source = f"sample:{doc['id']}"
+        total_chunks += ingest_chunks(
+            client=client,
+            collection=args.collection,
+            embed_model=args.model,
+            ollama_url=args.ollama_url,
+            title=doc["title"],
+            source=source,
+            source_type="sample",
+            category=doc["category"],
+            tags=[],
+            chunks=chunks,
+            replace_existing=False,  # collection was just dropped
+            extra_payload={"sample_id": doc["id"]},
         )
 
-    client.upsert(collection_name=args.collection, points=points)
     print(
-        f"Ingested {len(points)} documents into collection '{args.collection}' "
-        f"using model '{args.model}'."
+        f"Ingested {total_chunks} chunks across {len(documents)} sample documents "
+        f"into collection '{args.collection}' using model '{args.model}'."
+    )
+
+
+def ingest_files_command(args: argparse.Namespace) -> None:
+    """CLI entrypoint for ingesting one or more local files (PDF/MD/TXT)."""
+    paths = [Path(p) for p in args.paths]
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"File(s) not found: {', '.join(missing)}")
+
+    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    client = QdrantClient(url=args.qdrant_url)
+
+    total_chunks = 0
+    for path in paths:
+        suffix = path.suffix.lower()
+        if suffix not in SUPPORTED_FILE_SUFFIXES:
+            print(f"  skipped {path.name}: unsupported extension '{suffix}'")
+            continue
+        data = path.read_bytes()
+        if len(data) > MAX_UPLOAD_BYTES:
+            print(
+                f"  skipped {path.name}: file is {len(data)} bytes, "
+                f"exceeds {MAX_UPLOAD_BYTES} byte limit"
+            )
+            continue
+        try:
+            report = ingest_bytes(
+                client=client,
+                collection=args.collection,
+                embed_model=args.model,
+                ollama_url=args.ollama_url,
+                filename=path.name,
+                data=data,
+                category=args.category,
+                tags=tags,
+                replace_existing=args.replace,
+                chunk_size=args.chunk_size,
+                chunk_overlap=args.chunk_overlap,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"  failed {path.name}: {exc}")
+            continue
+
+        if report.skipped_reason:
+            print(f"  skipped {path.name}: {report.skipped_reason}")
+            continue
+        page_info = f", {report.pages} pages" if report.pages else ""
+        print(
+            f"  {path.name} ({report.source_type}{page_info}): "
+            f"{report.chunks_ingested} chunks"
+        )
+        total_chunks += report.chunks_ingested
+
+    print(
+        f"Ingested {total_chunks} chunks total into collection '{args.collection}'."
     )
 
 
@@ -338,6 +767,12 @@ def create_rag_app(
                         "title": str(payload.get("title", "(untitled)")),
                         "category": str(payload.get("category", "unknown")),
                         "text": str(payload.get("text", "")),
+                        "source": payload.get("source"),
+                        "source_type": payload.get("source_type"),
+                        "chunk_index": payload.get("chunk_index"),
+                        "chunk_count": payload.get("chunk_count"),
+                        "page_start": payload.get("page_start"),
+                        "page_end": payload.get("page_end"),
                     }
                 )
 
@@ -356,10 +791,99 @@ def create_rag_app(
                     "score": item["score"],
                     "title": item["title"],
                     "category": item["category"],
+                    "source": item["source"],
+                    "source_type": item["source_type"],
+                    "chunk_index": item["chunk_index"],
+                    "chunk_count": item["chunk_count"],
+                    "page_start": item["page_start"],
+                    "page_end": item["page_end"],
                     "text_preview": format_preview(item["text"], max_length=180),
                 }
                 for item in contexts
             ],
+        }
+
+    @app.post("/ingest")
+    async def ingest_endpoint(
+        files: List[UploadFile] = File(..., description="PDF, MD, or TXT files"),
+        category: str = Form("uploaded"),
+        tags: str = Form("", description="Comma-separated tag list"),
+        replace: bool = Form(True, description="Replace existing chunks for the same source"),
+        chunk_size: int = Form(DEFAULT_CHUNK_WORDS, ge=1, le=4000),
+        chunk_overlap: int = Form(DEFAULT_CHUNK_OVERLAP, ge=0, le=2000),
+    ) -> Dict[str, Any]:
+        if not files:
+            raise HTTPException(status_code=400, detail="No files were uploaded.")
+        if chunk_overlap >= chunk_size:
+            raise HTTPException(
+                status_code=400,
+                detail="chunk_overlap must be strictly less than chunk_size.",
+            )
+
+        parsed_tags = [t.strip() for t in (tags or "").split(",") if t.strip()]
+        client = QdrantClient(url=qdrant_url)
+        results: List[Dict[str, Any]] = []
+        total = 0
+        for upload in files:
+            filename = upload.filename or "upload"
+            data = await upload.read()
+            if len(data) > MAX_UPLOAD_BYTES:
+                results.append(
+                    {
+                        "source": filename,
+                        "chunks_ingested": 0,
+                        "skipped_reason": (
+                            f"File is {len(data)} bytes; exceeds limit of "
+                            f"{MAX_UPLOAD_BYTES} bytes."
+                        ),
+                    }
+                )
+                continue
+            try:
+                report = ingest_bytes(
+                    client=client,
+                    collection=collection,
+                    embed_model=embed_model,
+                    ollama_url=ollama_url,
+                    filename=filename,
+                    data=data,
+                    category=category,
+                    tags=parsed_tags,
+                    replace_existing=replace,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                )
+            except ValueError as exc:
+                # Bad input (unsupported type, malformed PDF). Surface per-file.
+                results.append(
+                    {
+                        "source": filename,
+                        "chunks_ingested": 0,
+                        "skipped_reason": str(exc),
+                    }
+                )
+                continue
+            except RuntimeError as exc:
+                # Embedding/Qdrant failures abort the whole request.
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+            results.append(
+                {
+                    "source": report.source,
+                    "title": report.title,
+                    "source_type": report.source_type,
+                    "pages": report.pages,
+                    "chunks_ingested": report.chunks_ingested,
+                    "skipped_reason": report.skipped_reason,
+                }
+            )
+            total += report.chunks_ingested
+
+        return {
+            "collection": collection,
+            "embed_model": embed_model,
+            "total_chunks": total,
+            "results": results,
         }
 
     return app
@@ -400,7 +924,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest_parser.add_argument("--collection", default=DEFAULT_COLLECTION)
     ingest_parser.add_argument("--data-file", default=str(DEFAULT_DATA_FILE))
+    ingest_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_WORDS,
+        help="Words per chunk (default: %(default)s).",
+    )
+    ingest_parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=DEFAULT_CHUNK_OVERLAP,
+        help="Words of overlap between consecutive chunks (default: %(default)s).",
+    )
     ingest_parser.set_defaults(func=ingest_documents)
+
+    ingest_file_parser = subparsers.add_parser(
+        "ingest-file",
+        help="Chunk + embed local PDF/MD/TXT files and upsert them into Qdrant.",
+    )
+    ingest_file_parser.add_argument("--collection", default=DEFAULT_COLLECTION)
+    ingest_file_parser.add_argument(
+        "--category",
+        default="uploaded",
+        help="Category label written to each chunk's payload.",
+    )
+    ingest_file_parser.add_argument(
+        "--tags",
+        default="",
+        help="Comma-separated tags applied to every chunk.",
+    )
+    ingest_file_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_WORDS,
+        help="Words per chunk (default: %(default)s).",
+    )
+    ingest_file_parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=DEFAULT_CHUNK_OVERLAP,
+        help="Words of overlap between consecutive chunks (default: %(default)s).",
+    )
+    ingest_file_parser.add_argument(
+        "--no-replace",
+        dest="replace",
+        action="store_false",
+        help="Do NOT delete existing chunks for the same source before upserting.",
+    )
+    ingest_file_parser.set_defaults(replace=True, func=ingest_files_command)
+    ingest_file_parser.add_argument(
+        "paths",
+        nargs="+",
+        help="One or more file paths (.pdf, .md, .markdown, .txt).",
+    )
 
     query_parser = subparsers.add_parser(
         "query", help="Run semantic search against the collection."

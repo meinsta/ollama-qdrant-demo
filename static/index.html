@@ -90,9 +90,23 @@
     }
     .tag.score { color: var(--accent-2); }
     .cit .preview { color: var(--muted); font-size: 13px; }
+    .cit .meta-line { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
     .err { color: var(--danger); }
+    .ok { color: var(--accent-2); }
     .empty { color: var(--muted); font-style: italic; }
     .small { font-size: 12px; color: var(--muted); }
+    input[type="text"], input[type="file"] {
+      width: 100%; background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+      font: inherit; outline: none;
+    }
+    input[type="text"]:focus, input[type="file"]:focus { border-color: var(--accent); }
+    input[type="file"] { padding: 8px 10px; }
+    .checkbox-row { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+    .checkbox-row input { width: auto; }
+    .upload-status { display: grid; gap: 6px; margin-top: 10px; font-size: 13px; }
+    .upload-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .upload-row .name { font-weight: 600; }
     .kbd {
       font-family: var(--mono); font-size: 11px;
       background: #232b3c; border: 1px solid var(--border);
@@ -114,6 +128,46 @@
   </header>
 
   <main>
+    <section class="card">
+      <label>Add documents</label>
+      <div class="small" style="margin-bottom:10px;">
+        Upload PDF, Markdown, or text files. They are chunked, embedded with the
+        configured Ollama model, and upserted into the active Qdrant collection.
+      </div>
+      <div class="row">
+        <div style="flex: 2 1 280px;">
+          <label for="files">Files</label>
+          <input id="files" type="file" multiple accept=".pdf,.txt,.md,.markdown" />
+        </div>
+        <div style="flex: 1 1 140px;">
+          <label for="category">Category</label>
+          <input id="category" type="text" value="uploaded" />
+        </div>
+        <div style="flex: 1 1 160px;">
+          <label for="tags">Tags (comma separated)</label>
+          <input id="tags" type="text" placeholder="e.g. pricing, 2024" />
+        </div>
+      </div>
+      <div class="row" style="margin-top: 10px;">
+        <div style="flex: 0 0 140px;">
+          <label for="chunk-size">Chunk size (words)</label>
+          <input id="chunk-size" type="number" min="1" max="4000" value="400" />
+        </div>
+        <div style="flex: 0 0 160px;">
+          <label for="chunk-overlap">Chunk overlap (words)</label>
+          <input id="chunk-overlap" type="number" min="0" max="2000" value="50" />
+        </div>
+        <div class="checkbox-row" style="flex: 1; padding-bottom: 4px;">
+          <input id="replace" type="checkbox" checked />
+          <label for="replace" style="margin: 0;">Replace existing chunks for the same file</label>
+        </div>
+        <div class="actions">
+          <button id="upload">Upload &amp; ingest</button>
+        </div>
+      </div>
+      <div id="upload-status" class="upload-status"></div>
+    </section>
+
     <section class="card">
       <label for="message">Your question</label>
       <textarea id="message" placeholder="e.g. How do I run Qdrant locally?"></textarea>
@@ -187,18 +241,39 @@
           <div class="head">
             <div class="title"></div>
             <div class="tags">
-              <span class="tag">id: <span class="cid"></span></span>
+              <span class="tag csource" hidden>source: <span></span></span>
               <span class="tag">category: <span class="ccat"></span></span>
+              <span class="tag cpage" hidden>page: <span></span></span>
+              <span class="tag cchunk" hidden>chunk: <span></span></span>
               <span class="tag score">score: <span class="cscore"></span></span>
             </div>
           </div>
           <div class="preview"></div>
         `;
         el.querySelector(".title").textContent = c.title ?? "(untitled)";
-        el.querySelector(".cid").textContent = String(c.id ?? "—");
         el.querySelector(".ccat").textContent = c.category ?? "unknown";
         el.querySelector(".cscore").textContent = String(score);
         el.querySelector(".preview").textContent = c.text_preview ?? "";
+
+        if (c.source) {
+          const tag = el.querySelector(".csource");
+          tag.hidden = false;
+          tag.querySelector("span").textContent = c.source;
+        }
+        if (c.page_start != null) {
+          const tag = el.querySelector(".cpage");
+          tag.hidden = false;
+          tag.querySelector("span").textContent =
+            c.page_end != null && c.page_end !== c.page_start
+              ? `${c.page_start}–${c.page_end}`
+              : String(c.page_start);
+        }
+        if (c.chunk_index != null) {
+          const tag = el.querySelector(".cchunk");
+          tag.hidden = false;
+          const total = c.chunk_count != null ? `/${c.chunk_count}` : "";
+          tag.querySelector("span").textContent = `${c.chunk_index + 1}${total}`;
+        }
         citationsEl.appendChild(el);
       }
     }
@@ -260,6 +335,102 @@
         ask();
       }
     });
+
+    // -------------------------------------------------------------------
+    // Upload + ingest
+    // -------------------------------------------------------------------
+    const filesEl = $("files");
+    const categoryEl = $("category");
+    const tagsEl = $("tags");
+    const chunkSizeEl = $("chunk-size");
+    const chunkOverlapEl = $("chunk-overlap");
+    const replaceEl = $("replace");
+    const uploadEl = $("upload");
+    const uploadStatusEl = $("upload-status");
+
+    function renderUploadStatus(payload) {
+      uploadStatusEl.innerHTML = "";
+      const summary = document.createElement("div");
+      summary.className = "small";
+      summary.textContent =
+        `Ingested ${payload.total_chunks} chunks total into ` +
+        `'${payload.collection}' (model: ${payload.embed_model}).`;
+      uploadStatusEl.appendChild(summary);
+      for (const r of payload.results || []) {
+        const row = document.createElement("div");
+        row.className = "upload-row";
+        const name = document.createElement("span");
+        name.className = "name";
+        name.textContent = r.source || "(unknown)";
+        row.appendChild(name);
+        if (r.skipped_reason) {
+          const reason = document.createElement("span");
+          reason.className = "err";
+          reason.textContent = `– skipped: ${r.skipped_reason}`;
+          row.appendChild(reason);
+        } else {
+          const ok = document.createElement("span");
+          ok.className = "ok";
+          const pageInfo = r.pages ? `, ${r.pages} pages` : "";
+          ok.textContent =
+            `– ${r.chunks_ingested} chunks (${r.source_type}${pageInfo})`;
+          row.appendChild(ok);
+        }
+        uploadStatusEl.appendChild(row);
+      }
+    }
+
+    async function uploadFiles() {
+      const files = filesEl.files;
+      if (!files || files.length === 0) {
+        filesEl.focus();
+        uploadStatusEl.innerHTML = '<div class="err">Pick at least one file.</div>';
+        return;
+      }
+      const chunkSize = parseInt(chunkSizeEl.value, 10);
+      const chunkOverlap = parseInt(chunkOverlapEl.value, 10);
+      if (!Number.isFinite(chunkSize) || chunkSize < 1) {
+        uploadStatusEl.innerHTML = '<div class="err">Chunk size must be ≥ 1.</div>';
+        return;
+      }
+      if (!Number.isFinite(chunkOverlap) || chunkOverlap < 0 || chunkOverlap >= chunkSize) {
+        uploadStatusEl.innerHTML =
+          '<div class="err">Chunk overlap must be ≥ 0 and &lt; chunk size.</div>';
+        return;
+      }
+
+      const fd = new FormData();
+      for (const f of files) fd.append("files", f);
+      fd.append("category", categoryEl.value || "uploaded");
+      fd.append("tags", tagsEl.value || "");
+      fd.append("replace", replaceEl.checked ? "true" : "false");
+      fd.append("chunk_size", String(chunkSize));
+      fd.append("chunk_overlap", String(chunkOverlap));
+
+      uploadEl.disabled = true;
+      const oldLabel = uploadEl.textContent;
+      uploadEl.textContent = "Uploading…";
+      uploadStatusEl.innerHTML = '<div class="empty">Embedding chunks… this can take a moment for large PDFs.</div>';
+
+      try {
+        const res = await fetch("/ingest", { method: "POST", body: fd });
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = null; }
+        if (!res.ok) {
+          const detail = data && data.detail ? data.detail : text || `HTTP ${res.status}`;
+          throw new Error(detail);
+        }
+        renderUploadStatus(data);
+      } catch (e) {
+        uploadStatusEl.innerHTML = `<div class="err">Error: ${e.message || e}</div>`;
+      } finally {
+        uploadEl.disabled = false;
+        uploadEl.textContent = oldLabel;
+      }
+    }
+
+    uploadEl.addEventListener("click", uploadFiles);
 
     checkHealth();
     setInterval(checkHealth, 10000);
