@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import requests
@@ -13,10 +15,16 @@ from qdrant_client import QdrantClient, models
 
 DEFAULT_COLLECTION = "ollama_demo_docs"
 DEFAULT_DATA_FILE = Path(__file__).with_name("sample_data.json")
+STATIC_DIR = Path(__file__).with_name("static")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 DEFAULT_EMBED_MODEL = os.getenv("OLLAMA_MODEL", "nomic-embed-text")
 DEFAULT_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2")
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1)
+    limit: Optional[int] = Field(default=None, ge=1, le=10)
 
 
 def load_documents(data_file: Path) -> List[Dict[str, Any]]:
@@ -149,12 +157,13 @@ def search_documents(
 ) -> List[Any]:
     client = QdrantClient(url=qdrant_url)
     query_vector = get_embedding(query, model, ollama_url)
-    return client.search(
+    response = client.query_points(
         collection_name=collection,
-        query_vector=query_vector,
+        query=query_vector,
         limit=limit,
         with_payload=True,
     )
+    return response.points
 
 
 def build_rag_prompt(message: str, contexts: List[Dict[str, Any]]) -> str:
@@ -296,9 +305,12 @@ def create_rag_app(
 ) -> FastAPI:
     app = FastAPI(title="Tiny RAG Chat API", version="0.1.0")
 
-    class ChatRequest(BaseModel):
-        message: str = Field(min_length=1)
-        limit: Optional[int] = Field(default=None, ge=1, le=10)
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+        @app.get("/", include_in_schema=False)
+        def index() -> FileResponse:
+            return FileResponse(STATIC_DIR / "index.html")
 
     @app.get("/health")
     def health() -> Dict[str, str]:

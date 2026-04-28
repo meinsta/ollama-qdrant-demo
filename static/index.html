@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tiny RAG Playground</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #161a22;
+      --panel-2: #1d2330;
+      --border: #262d3a;
+      --text: #e6e8ee;
+      --muted: #9aa3b2;
+      --accent: #7c9cff;
+      --accent-2: #8cf0c8;
+      --danger: #ff6b6b;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 600px at 80% -10%, #1b2540 0%, transparent 60%), var(--bg);
+      color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 20px; border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; background: rgba(15,17,21,0.85); backdrop-filter: blur(8px);
+      z-index: 5;
+    }
+    header h1 { margin: 0; font-size: 15px; letter-spacing: 0.2px; }
+    header .sub { color: var(--muted); font-size: 12px; }
+    .health {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
+      background: var(--panel); font-size: 12px; color: var(--muted);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #5a6376; }
+    .dot.ok { background: var(--accent-2); }
+    .dot.bad { background: var(--danger); }
+    main {
+      max-width: 980px; margin: 0 auto; padding: 20px;
+      display: grid; gap: 16px;
+    }
+    .card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      padding: 16px;
+    }
+    label { display:block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    textarea, input[type="number"] {
+      width: 100%; background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+      font: inherit; outline: none; resize: vertical;
+    }
+    textarea { min-height: 90px; }
+    textarea:focus, input:focus { border-color: var(--accent); }
+    .row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
+    .row > * { flex: 1; min-width: 120px; }
+    .row .actions { flex: 0 0 auto; }
+    button {
+      background: var(--accent); color: #0b0e15; border: 0;
+      padding: 10px 16px; border-radius: 8px; font-weight: 600;
+      cursor: pointer; transition: filter 0.15s ease;
+    }
+    button:hover { filter: brightness(1.05); }
+    button:disabled { background: #3a445c; color: #99a1b3; cursor: not-allowed; }
+    .answer {
+      white-space: pre-wrap; background: var(--panel-2);
+      border: 1px solid var(--border); border-radius: 8px; padding: 14px;
+      min-height: 60px;
+    }
+    .meta { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    .citations { display: grid; gap: 10px; }
+    .cit {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 12px;
+    }
+    .cit .head {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      margin-bottom: 4px; flex-wrap: wrap;
+    }
+    .cit .title { font-weight: 600; }
+    .cit .tags { display: flex; gap: 6px; flex-wrap: wrap; }
+    .tag {
+      font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: #232b3c; color: var(--muted); border: 1px solid var(--border);
+    }
+    .tag.score { color: var(--accent-2); }
+    .cit .preview { color: var(--muted); font-size: 13px; }
+    .err { color: var(--danger); }
+    .empty { color: var(--muted); font-style: italic; }
+    .small { font-size: 12px; color: var(--muted); }
+    .kbd {
+      font-family: var(--mono); font-size: 11px;
+      background: #232b3c; border: 1px solid var(--border);
+      padding: 1px 6px; border-radius: 4px; color: var(--muted);
+    }
+    footer { padding: 16px 20px 28px; text-align: center; color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Tiny RAG Playground</h1>
+      <div class="sub">Qdrant + Ollama · POST <code>/chat</code></div>
+    </div>
+    <div class="health" id="health">
+      <span class="dot" id="dot"></span>
+      <span id="health-text">checking…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <label for="message">Your question</label>
+      <textarea id="message" placeholder="e.g. How do I run Qdrant locally?"></textarea>
+      <div class="row" style="margin-top: 12px;">
+        <div style="flex: 0 0 140px;">
+          <label for="limit">Retrieval limit</label>
+          <input id="limit" type="number" min="1" max="10" value="3" />
+        </div>
+        <div class="small" style="flex: 1;">
+          Tip: press <span class="kbd">⌘</span>+<span class="kbd">Enter</span> (or <span class="kbd">Ctrl</span>+<span class="kbd">Enter</span>) to send.
+        </div>
+        <div class="actions">
+          <button id="send">Ask</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <label>Answer</label>
+      <div id="answer" class="answer empty">Ask something to see the model's answer here.</div>
+      <div id="answer-meta" class="meta"></div>
+    </section>
+
+    <section class="card">
+      <label>Citations</label>
+      <div id="citations" class="citations">
+        <div class="empty">Retrieved context will appear here after you ask a question.</div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Local only · served by FastAPI on the same origin as <code>/chat</code>
+  </footer>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const messageEl = $("message");
+    const limitEl = $("limit");
+    const sendEl = $("send");
+    const answerEl = $("answer");
+    const answerMetaEl = $("answer-meta");
+    const citationsEl = $("citations");
+    const dotEl = $("dot");
+    const healthTextEl = $("health-text");
+
+    async function checkHealth() {
+      try {
+        const res = await fetch("/health", { cache: "no-store" });
+        if (!res.ok) throw new Error("bad status");
+        const data = await res.json();
+        dotEl.className = "dot ok";
+        healthTextEl.textContent = `online · ${data.status || "ok"}`;
+      } catch (e) {
+        dotEl.className = "dot bad";
+        healthTextEl.textContent = "offline";
+      }
+    }
+
+    function renderCitations(citations) {
+      if (!citations || citations.length === 0) {
+        citationsEl.innerHTML = '<div class="empty">No citations returned.</div>';
+        return;
+      }
+      citationsEl.innerHTML = "";
+      for (const c of citations) {
+        const el = document.createElement("div");
+        el.className = "cit";
+        const score = typeof c.score === "number" ? c.score.toFixed(4) : c.score;
+        el.innerHTML = `
+          <div class="head">
+            <div class="title"></div>
+            <div class="tags">
+              <span class="tag">id: <span class="cid"></span></span>
+              <span class="tag">category: <span class="ccat"></span></span>
+              <span class="tag score">score: <span class="cscore"></span></span>
+            </div>
+          </div>
+          <div class="preview"></div>
+        `;
+        el.querySelector(".title").textContent = c.title ?? "(untitled)";
+        el.querySelector(".cid").textContent = String(c.id ?? "—");
+        el.querySelector(".ccat").textContent = c.category ?? "unknown";
+        el.querySelector(".cscore").textContent = String(score);
+        el.querySelector(".preview").textContent = c.text_preview ?? "";
+        citationsEl.appendChild(el);
+      }
+    }
+
+    async function ask() {
+      const message = messageEl.value.trim();
+      if (!message) {
+        messageEl.focus();
+        return;
+      }
+      const limitRaw = parseInt(limitEl.value, 10);
+      const body = { message };
+      if (Number.isFinite(limitRaw) && limitRaw >= 1 && limitRaw <= 10) {
+        body.limit = limitRaw;
+      }
+
+      sendEl.disabled = true;
+      const oldLabel = sendEl.textContent;
+      sendEl.textContent = "Thinking…";
+      answerEl.classList.remove("err");
+      answerEl.classList.remove("empty");
+      answerEl.textContent = "…";
+      answerMetaEl.textContent = "";
+      citationsEl.innerHTML = '<div class="empty">Retrieving…</div>';
+
+      const started = performance.now();
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = null; }
+        if (!res.ok) {
+          const detail = data && data.detail ? data.detail : text || `HTTP ${res.status}`;
+          throw new Error(detail);
+        }
+        const elapsed = ((performance.now() - started) / 1000).toFixed(2);
+        answerEl.textContent = data.answer || "(empty answer)";
+        answerMetaEl.textContent = `model: ${data.chat_model} · collection: ${data.collection} · ${elapsed}s`;
+        renderCitations(data.citations);
+      } catch (e) {
+        answerEl.classList.add("err");
+        answerEl.textContent = `Error: ${e.message || e}`;
+        answerMetaEl.textContent = "";
+        citationsEl.innerHTML = '<div class="empty">No citations.</div>';
+      } finally {
+        sendEl.disabled = false;
+        sendEl.textContent = oldLabel;
+      }
+    }
+
+    sendEl.addEventListener("click", ask);
+    messageEl.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        ask();
+      }
+    });
+
+    checkHealth();
+    setInterval(checkHealth, 10000);
+  </script>
+</body>
+</html>
