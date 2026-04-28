@@ -1,0 +1,50 @@
+[
+  {
+    "id": 1,
+    "title": "Run Qdrant in Docker",
+    "category": "qdrant",
+    "text": "Qdrant can run as a local Docker container. Expose port 6333 to query the REST API from your application."
+  },
+  {
+    "id": 2,
+    "title": "Ollama embedding model",
+    "category": "ollama",
+    "text": "Use ollama pull nomic-embed-text to install an embedding model. Then call /api/embed or /api/embeddings to generate vectors."
+  },
+  {
+    "id": 3,
+    "title": "Vector search workflow",
+    "category": "concepts",
+    "text": "A common workflow is: embed text chunks, store vectors in Qdrant, then embed user queries and retrieve nearest neighbors."
+  },
+  {
+    "id": 4,
+    "title": "Collection design",
+    "category": "qdrant",
+    "text": "In Qdrant each collection has a fixed vector size and distance metric. Cosine distance is a frequent default for text embeddings."
+  },
+  {
+    "id": 5,
+    "title": "Metadata payloads",
+    "category": "concepts",
+    "text": "Attach metadata payloads like title and category to every point so traversal and filtering are easier."
+  },
+  {
+    "id": 6,
+    "title": "Local RAG prototype",
+    "category": "rag",
+    "text": "For a local RAG prototype, Ollama handles embeddings while Qdrant stores and retrieves similar chunks for grounding."
+  },
+  {
+    "id": 7,
+    "title": "Traversing points",
+    "category": "qdrant",
+    "text": "Use Qdrant scroll pagination to traverse every point in a collection without running a semantic search query."
+  },
+  {
+    "id": 8,
+    "title": "Search quality",
+    "category": "rag",
+    "text": "Retrieval quality improves when chunks are concise, domain specific, and embedded with a model that matches your query style."
+  }
+]
