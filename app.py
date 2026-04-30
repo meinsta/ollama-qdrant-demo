@@ -1356,6 +1356,70 @@ def _load_eval_queries(path: Path) -> List[Dict[str, Any]]:
     return out
 
 
+def _gather_expected(
+    entry: Dict[str, Any],
+) -> Tuple[List[str], Optional[List[int]]]:
+    """Pull expected sources and pages out of a qa_eval entry.
+
+    Both singular (``expected_source``, ``expected_page``) and plural
+    (``expected_sources``, ``expected_pages``) forms are accepted and merged.
+    Returns ``(sources, pages)`` where ``pages`` is ``None`` when the entry
+    doesn't pin a specific page (any chunk of the matching source counts).
+    """
+    sources: List[str] = []
+    raw_source = entry.get("expected_source")
+    if isinstance(raw_source, str):
+        sources.append(raw_source)
+    raw_sources = entry.get("expected_sources")
+    if isinstance(raw_sources, list):
+        sources.extend(str(s) for s in raw_sources if isinstance(s, str))
+
+    pages: List[int] = []
+    raw_page = entry.get("expected_page")
+    if isinstance(raw_page, int):
+        pages.append(raw_page)
+    raw_pages = entry.get("expected_pages")
+    if isinstance(raw_pages, list):
+        pages.extend(int(p) for p in raw_pages if isinstance(p, int))
+
+    return sources, (pages or None)
+
+
+def _is_chunk_match(
+    point: Any,
+    expected_sources: Sequence[str],
+    expected_pages: Optional[Sequence[int]] = None,
+) -> bool:
+    """True when ``point`` satisfies the expected source/page constraints.
+
+    The match logic is intentionally simple:
+      - If ``expected_sources`` is non-empty, the point's payload ``source``
+        must equal one of them.
+      - If ``expected_pages`` is supplied, the chunk's ``page_start``..
+        ``page_end`` range must cover at least one of the expected pages
+        (page numbers are 1-indexed and inclusive on both ends, matching
+        what the ingest pipeline writes for PDFs).
+      - With neither constraint provided, no row can match — callers
+        compute recall only for rows that actually have expectations.
+    """
+    if not expected_sources and not expected_pages:
+        return False
+    payload = getattr(point, "payload", None) or {}
+    if expected_sources:
+        if payload.get("source") not in expected_sources:
+            return False
+    if expected_pages:
+        page_start = payload.get("page_start")
+        page_end = payload.get("page_end")
+        if page_start is None or page_end is None:
+            return False
+        for p in expected_pages:
+            if int(page_start) <= int(p) <= int(page_end):
+                return True
+        return False
+    return True
+
+
 def bench_command(args: argparse.Namespace) -> None:
     """Run a tiny benchmark over a labeled query set and print latency + recall.
 
@@ -1487,6 +1551,173 @@ def bench_command(args: argparse.Namespace) -> None:
     print(
         "Latency is end-to-end retrieval (embed + search + rerank). "
         "Recall@k counts queries whose expected_source appears in top-k."
+    )
+
+
+def eval_command(args: argparse.Namespace) -> None:
+    """Evaluate retrieval quality on a labeled query set.
+
+    Sweeps a small grid of retrieval configurations against the same query
+    file used by ``bench`` and reports recall@k, mean reciprocal rank (MRR),
+    and mean end-to-end latency per config. Where ``bench`` focuses on
+    latency percentiles, ``eval`` focuses on quality metrics so SAs can
+    answer "does reranking actually help?" with a single command.
+
+    Configs evaluated:
+      - baseline (the auto-selected dense / hybrid mode for the collection)
+      - baseline+rescore (only when ``--include-rescore``; rescore=True,
+        oversampling=2.0; only meaningful on quantized collections)
+      - rerank (skipped when ``--no-rerank``)
+      - rerank+rescore (when both flags are active)
+    """
+    queries = _load_eval_queries(Path(args.queries_file))
+    if not queries:
+        raise ValueError("Eval file contains no queries.")
+
+    include_rerank = not args.no_rerank
+    include_rescore = bool(args.include_rescore)
+
+    configs: List[Dict[str, Any]] = [
+        {
+            "label": "baseline",
+            "rerank": False,
+            "rescore": None,
+            "oversampling": None,
+        }
+    ]
+    if include_rescore:
+        configs.append(
+            {
+                "label": "baseline+rescore",
+                "rerank": False,
+                "rescore": True,
+                "oversampling": 2.0,
+            }
+        )
+    if include_rerank:
+        configs.append(
+            {
+                "label": "rerank",
+                "rerank": True,
+                "rescore": None,
+                "oversampling": None,
+            }
+        )
+        if include_rescore:
+            configs.append(
+                {
+                    "label": "rerank+rescore",
+                    "rerank": True,
+                    "rescore": True,
+                    "oversampling": 2.0,
+                }
+            )
+
+    rows: List[Dict[str, Any]] = []
+    for cfg in configs:
+        latencies: List[float] = []
+        hits = 0
+        scored_queries = 0
+        rr_sum = 0.0
+        last_mode: str = ""
+
+        # Warmup once per config so the first timed query isn't skewed by
+        # encoder loading (Ollama, sparse BM42, cross-encoder).
+        try:
+            search_documents(
+                queries[0]["query"],
+                qdrant_url=args.qdrant_url,
+                ollama_url=args.ollama_url,
+                collection=args.collection,
+                model=args.model,
+                limit=args.limit,
+                rescore=cfg["rescore"],
+                oversampling=cfg["oversampling"],
+                hnsw_ef=args.hnsw_ef,
+                rerank=cfg["rerank"],
+                rerank_model=args.rerank_model,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Eval warmup failed: {exc}") from exc
+
+        for entry in queries:
+            query_text = entry["query"]
+            expected_sources, expected_pages = _gather_expected(entry)
+
+            results: List[Any] = []
+            for _ in range(args.repeats):
+                t0 = time.perf_counter()
+                results, last_mode = search_documents(
+                    query_text,
+                    qdrant_url=args.qdrant_url,
+                    ollama_url=args.ollama_url,
+                    collection=args.collection,
+                    model=args.model,
+                    limit=args.limit,
+                    rescore=cfg["rescore"],
+                    oversampling=cfg["oversampling"],
+                    hnsw_ef=args.hnsw_ef,
+                    rerank=cfg["rerank"],
+                    rerank_model=args.rerank_model,
+                )
+                latencies.append((time.perf_counter() - t0) * 1000.0)
+
+            # Quality metrics use the *last* run's ranking. Recall@k is
+            # 1 if any expected chunk shows up in the top-k; reciprocal
+            # rank is 1/rank of the first match (0 on a miss).
+            if expected_sources or expected_pages:
+                scored_queries += 1
+                hit_rank = 0
+                for rank, point in enumerate(results, start=1):
+                    if _is_chunk_match(point, expected_sources, expected_pages):
+                        hit_rank = rank
+                        break
+                if hit_rank:
+                    hits += 1
+                    rr_sum += 1.0 / hit_rank
+
+        rows.append(
+            {
+                "label": cfg["label"],
+                "mode": last_mode,
+                "runs": len(latencies),
+                "mean": (sum(latencies) / len(latencies)) if latencies else 0.0,
+                "hits": hits,
+                "total": scored_queries,
+                "mrr": (rr_sum / scored_queries) if scored_queries else 0.0,
+            }
+        )
+
+    print(
+        f"Eval: {len(queries)} queries x {args.repeats} repeats "
+        f"on '{args.collection}' (limit={args.limit}, hnsw_ef={args.hnsw_ef})."
+    )
+    print()
+    recall_label = f"recall@{args.limit}"
+    header = (
+        f"  {'config':18s} {'mode':16s} {'runs':>5s} "
+        f"{'mean (ms)':>10s} {recall_label:>14s} {'MRR':>7s}"
+    )
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for row in rows:
+        if row["total"] > 0:
+            recall_pct = row["hits"] / row["total"] * 100
+            recall_str = f"{recall_pct:5.1f}% ({row['hits']}/{row['total']})"
+            mrr_str = f"{row['mrr']:.3f}"
+        else:
+            recall_str = "-"
+            mrr_str = "-"
+        print(
+            f"  {row['label']:18s} {row['mode']:16s} "
+            f"{row['runs']:>5d} {row['mean']:>10.1f} "
+            f"{recall_str:>14s} {mrr_str:>7s}"
+        )
+    print()
+    print(
+        "MRR = mean of 1/rank for queries whose expected_source[/page] is in "
+        "top-k; misses contribute 0. Set expected_page in qa_eval.json for "
+        "finer-grained matching against PDF chunks."
     )
 
 
@@ -2159,6 +2390,77 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bench_parser.set_defaults(func=bench_command)
+
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help=(
+            "Evaluate retrieval quality on a labeled query set. Reports "
+            "recall@k, MRR, and mean latency for baseline vs +rerank "
+            "(and optionally +rescore) configs."
+        ),
+    )
+    eval_parser.add_argument("--collection", default=DEFAULT_COLLECTION)
+    eval_parser.add_argument(
+        "--queries-file",
+        dest="queries_file",
+        default=str(DEFAULT_EVAL_FILE),
+        help=(
+            "JSON list of {query, expected_source?, expected_sources?, "
+            "expected_page?, expected_pages?} entries. Defaults to "
+            "qa_eval.json next to app.py."
+        ),
+    )
+    eval_parser.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="Top-k size for retrieval and recall@k (default: %(default)s).",
+    )
+    eval_parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help=(
+            "Timed runs per query per config. Eval averages latency over "
+            "all runs and computes quality metrics from the last run "
+            "(default: %(default)s)."
+        ),
+    )
+    eval_parser.add_argument(
+        "--hnsw-ef",
+        dest="hnsw_ef",
+        type=int,
+        default=None,
+        help="Per-query HNSW ef applied to every config in this eval.",
+    )
+    eval_parser.add_argument(
+        "--rerank-model",
+        dest="rerank_model",
+        default=None,
+        help=(
+            "fastembed cross-encoder model id used for the rerank configs. "
+            f"Defaults to '{DEFAULT_RERANK_MODEL}'."
+        ),
+    )
+    eval_parser.add_argument(
+        "--no-rerank",
+        dest="no_rerank",
+        action="store_true",
+        default=False,
+        help="Skip the rerank configs and only evaluate the baseline.",
+    )
+    eval_parser.add_argument(
+        "--include-rescore",
+        dest="include_rescore",
+        action="store_true",
+        default=False,
+        help=(
+            "Also evaluate quantization rescore=True + oversampling=2.0 "
+            "variants alongside the default configs (only meaningful on "
+            "quantized collections)."
+        ),
+    )
+    eval_parser.set_defaults(func=eval_command)
 
     return parser
 

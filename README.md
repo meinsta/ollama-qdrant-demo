@@ -28,10 +28,10 @@ This README doubles as a developer tutorial: it walks through the ingestion pipe
 ```
 The ingest pipeline is shared by three entrypoints — the `ingest` CLI (sample JSON), the `ingest-file` CLI (local PDF/MD/TXT), and the `POST /ingest` endpoint — all of which funnel into `ingest_chunks` in `app.py`. The /chat endpoint and `query` CLI share `search_documents`, which automatically picks hybrid or dense-only retrieval based on what the collection and runtime support.
 ## Project layout
-- `app.py` — single-file CLI + FastAPI app. Subcommands: `ingest`, `ingest-file`, `query`, `traverse`, `serve`, `memory`, `quantize`, `bench`.
+- `app.py` — single-file CLI + FastAPI app. Subcommands: `ingest`, `ingest-file`, `query`, `traverse`, `serve`, `memory`, `quantize`, `bench`, `eval`.
 - `static/index.html` — single-file HTML/CSS/JS GUI served by `serve` (upload card + chat box + citations).
 - `sample_data.json` — 8 example documents used by `ingest` (a JSON list of `{id, title, text, category}`).
-- `qa_eval.json` — 8 labeled queries (`{query, expected_source}`) consumed by `bench` for recall@k.
+- `qa_eval.json` — 8 labeled queries (`{query, expected_source}`) consumed by `bench` (recall@k + latency) and `eval` (recall@k + MRR).
 - `requirements.txt` — Python deps: `qdrant-client`, `requests`, `fastapi`, `uvicorn`, `pydantic`, `pypdf`, `python-multipart`, plus optional `fastembed` (enables hybrid BM42 search).
 Key symbols inside `app.py`, if you want to read along:
 - `extract_pdf_pages`, `extract_chunks_from_bytes` — file → tokens with optional page numbers.
@@ -292,6 +292,32 @@ Bench: 8 queries x 5 repeats on 'ollama_demo_docs' (limit=3, hnsw_ef=128).
   ----------------------------------------------------------------------------------
   no rerank    hybrid             40       42.3       58.1       45.7   87.5% (7/8)
   rerank       hybrid+rerank      40       72.4       91.7       76.1  100.0% (8/8)
+```
+### `eval` — recall@k + MRR sweep across retrieval configs
+```bash
+python app.py eval [--collection NAME] [--queries-file qa_eval.json] \
+                   [--limit 3] [--repeats 3] [--hnsw-ef 128] \
+                   [--rerank-model MODEL_ID] [--no-rerank] [--include-rescore]
+```
+Where `bench` focuses on latency percentiles, `eval` focuses on retrieval *quality*. It sweeps a small grid of configs against the same query set and reports recall@k, mean reciprocal rank (MRR), and mean end-to-end latency per config.
+Configs evaluated by default: `baseline` (the auto-selected dense / hybrid mode) and `rerank` (cross-encoder on top). `--no-rerank` skips the rerank config; `--include-rescore` adds `baseline+rescore` and (when reranking) `rerank+rescore` variants that pass `rescore=True` + `oversampling=2.0` through to Qdrant — only meaningful on quantized collections.
+**MRR (mean reciprocal rank)** is the average of `1/rank` for the first matching chunk in the top-k across all scored queries; misses contribute 0. Recall@k tells you whether the right chunk is *somewhere* in the top-k; MRR additionally rewards configs that rank it higher. Reranking typically lifts both, but MRR is what moves most when the right chunk was already in top-k but buried at position 3.
+Eval entries support a richer schema than bench:
+```json
+[
+  { "query": "How do I run Qdrant locally with Docker?", "expected_source": "sample:1" },
+  { "query": "What does the pricing section say?", "expected_source": "whitepaper.pdf", "expected_page": 4 },
+  { "query": "Multi-source", "expected_sources": ["a.md", "b.md"], "expected_pages": [2, 3] }
+]
+```
+`expected_page` / `expected_pages` (1-indexed) tighten the match: a chunk only counts if its `page_start..page_end` range covers one of the expected pages. Useful for PDFs where a source-only match is too lenient (a long PDF can have many chunks; you want recall on the *right* chunk, not just any chunk).
+Example output:
+```
+Eval: 8 queries x 3 repeats on 'ollama_demo_docs' (limit=3, hnsw_ef=128).
+  config             mode             runs  mean (ms)       recall@3     MRR
+  -----------------------------------------------------------------------------
+  baseline           hybrid             24       46.2   87.5% (7/8)   0.792
+  rerank             hybrid+rerank      24       77.8  100.0% (8/8)   0.958
 ```
 ## HTTP API reference
 ### `GET /` — browser GUI
