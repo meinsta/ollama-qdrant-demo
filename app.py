@@ -24,6 +24,9 @@ DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 DEFAULT_EMBED_MODEL = os.getenv("OLLAMA_MODEL", "nomic-embed-text")
 DEFAULT_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2")
+# Reranker default. Small (~22MB), fast, MS MARCO-trained cross-encoder —
+# a sensible "rerank with sane defaults" choice for the demo.
+DEFAULT_RERANK_MODEL = os.getenv("RERANK_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2")
 
 # Chunking defaults. Word-based windowing keeps the demo dependency-light
 # (no tokenizer required) while still producing reasonable chunks for the
@@ -40,6 +43,8 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file; demo guardrail.
 
 # Module-level cache for the sparse embedding model (lazy-loaded on first use).
 _sparse_encoder: Optional[Any] = None
+# Module-level cache for cross-encoder rerankers, keyed by model name.
+_reranker_cache: Dict[str, Any] = {}
 
 
 class ChatRequest(BaseModel):
@@ -50,6 +55,9 @@ class ChatRequest(BaseModel):
     filter_source: Optional[str] = None
     filter_source_type: Optional[str] = None
     filter_tags: Optional[List[str]] = None
+    # Optional cross-encoder reranking. None means "use server default".
+    rerank: Optional[bool] = None
+    rerank_model: Optional[str] = None
 
 
 def load_documents(data_file: Path) -> List[Dict[str, Any]]:
@@ -197,6 +205,76 @@ def get_sparse_embedding(text: str) -> Optional[models.SparseVector]:
         )
     except Exception:
         return None
+
+
+def _reranker_available() -> bool:
+    """Return True if fastembed's cross-encoder reranker can be loaded."""
+    try:
+        from fastembed.rerank.cross_encoder import TextCrossEncoder  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _get_reranker(model_name: str) -> Any:
+    """Lazy-load and cache a cross-encoder reranker keyed by model name.
+
+    Caching by name (instead of a single global) lets SAs swap models live
+    — e.g. ms-marco-MiniLM vs jina-reranker-v1-tiny — without paying the
+    download/init cost twice for the same model.
+    """
+    cached = _reranker_cache.get(model_name)
+    if cached is not None:
+        return cached
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+    encoder = TextCrossEncoder(model_name=model_name)
+    _reranker_cache[model_name] = encoder
+    return encoder
+
+
+def rerank_points(
+    query: str,
+    points: Sequence[Any],
+    *,
+    top_k: int,
+    model_name: str = DEFAULT_RERANK_MODEL,
+) -> List[Any]:
+    """Re-rank ``points`` using a cross-encoder and return the top ``top_k``.
+
+    The original retrieval score on each point is replaced with the rerank
+    score so downstream consumers (CLI, /chat citations, GUI) see the value
+    that drove the new ordering. Returns the same point objects, sorted
+    descending by rerank score and truncated to ``top_k``.
+    """
+    if not points or top_k <= 0:
+        return list(points[:top_k])
+    if not _reranker_available():
+        # Caller asked for rerank but fastembed isn't installed; fall back
+        # to whatever ordering the prior stage produced.
+        return list(points[:top_k])
+
+    encoder = _get_reranker(model_name)
+    docs = [str((getattr(p, "payload", None) or {}).get("text", "")) for p in points]
+    try:
+        raw_scores = list(encoder.rerank(query, docs))
+    except Exception:
+        # Defensive fallback: if the encoder call fails, keep prior order.
+        return list(points[:top_k])
+
+    scored = sorted(
+        zip(points, raw_scores), key=lambda pair: float(pair[1]), reverse=True
+    )
+    out: List[Any] = []
+    for point, score in scored[:top_k]:
+        try:
+            point.score = float(score)
+        except Exception:
+            try:
+                object.__setattr__(point, "score", float(score))
+            except Exception:
+                pass
+        out.append(point)
+    return out
 
 
 def format_preview(text: str, max_length: int = 120) -> str:
@@ -770,16 +848,25 @@ def search_documents(
     filter_tags: Optional[List[str]] = None,
     rescore: Optional[bool] = None,
     oversampling: Optional[float] = None,
+    rerank: bool = False,
+    rerank_model: Optional[str] = None,
 ) -> Tuple[List[Any], str]:
     """Return (points, search_mode).
 
-    search_mode is 'hybrid' when dense and sparse vectors are fused via RRF,
-    or 'dense' when only the dense vector is used.
+    search_mode is one of: 'dense', 'hybrid', 'dense+rerank', 'hybrid+rerank'.
+    The base mode (dense vs hybrid) is auto-selected from the collection
+    config; the '+rerank' suffix is appended when ``rerank=True`` and the
+    cross-encoder reranker actually ran.
 
     ``rescore`` and ``oversampling`` are passed through to Qdrant's quantization
     search params. They have no effect on collections without quantization but
     are safe to set unconditionally — use them to demo recall vs latency on a
     quantized collection.
+
+    When ``rerank=True``, the function fetches a larger candidate pool from
+    the first stage (dense or hybrid) and re-orders it with a fastembed
+    cross-encoder before truncating to ``limit``. If fastembed isn't
+    installed the rerank stage silently no-ops and the suffix is omitted.
     """
     client = QdrantClient(url=qdrant_url)
     dense_vector = get_embedding(query, model, ollama_url)
@@ -790,6 +877,12 @@ def search_documents(
         tags=filter_tags,
     )
     search_params = build_quantization_search_params(rescore, oversampling)
+
+    # When reranking, ask the first stage for more candidates so the
+    # cross-encoder has enough material to actually re-order.
+    rerank_active = bool(rerank) and _reranker_available()
+    candidate_limit = max(limit * 5, 25) if rerank_active else limit
+    rerank_model_name = rerank_model or DEFAULT_RERANK_MODEL
 
     # Inspect the collection's vector configuration.
     has_sparse = False
@@ -809,12 +902,18 @@ def search_documents(
         response = client.query_points(
             collection_name=collection,
             query=dense_vector,
-            limit=limit,
+            limit=candidate_limit,
             with_payload=True,
             query_filter=query_filter,
             search_params=search_params,
         )
-        return response.points, "dense"
+        points = response.points
+        if rerank_active:
+            points = rerank_points(
+                query, points, top_k=limit, model_name=rerank_model_name
+            )
+            return points, "dense+rerank"
+        return points, "dense"
 
     if has_sparse:
         sparse_vec = get_sparse_embedding(query)
@@ -825,7 +924,7 @@ def search_documents(
         # Hybrid: prefetch from both indices, then fuse with RRF.
         # Quantization tuning only applies to the dense prefetch — sparse
         # vectors are not quantized.
-        prefetch_limit = max(limit * 4, 20)
+        prefetch_limit = max(candidate_limit * 4, 20)
         response = client.query_points(
             collection_name=collection,
             prefetch=[
@@ -844,22 +943,34 @@ def search_documents(
                 ),
             ],
             query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=limit,
+            limit=candidate_limit,
             with_payload=True,
         )
-        return response.points, "hybrid"
+        points = response.points
+        if rerank_active:
+            points = rerank_points(
+                query, points, top_k=limit, model_name=rerank_model_name
+            )
+            return points, "hybrid+rerank"
+        return points, "hybrid"
 
     # Named-vector dense-only search.
     response = client.query_points(
         collection_name=collection,
         query=dense_vector,
         using="dense",
-        limit=limit,
+        limit=candidate_limit,
         with_payload=True,
         query_filter=query_filter,
         search_params=search_params,
     )
-    return response.points, "dense"
+    points = response.points
+    if rerank_active:
+        points = rerank_points(
+            query, points, top_k=limit, model_name=rerank_model_name
+        )
+        return points, "dense+rerank"
+    return points, "dense"
 
 
 def build_rag_prompt(message: str, contexts: List[Dict[str, Any]]) -> str:
@@ -1022,6 +1133,8 @@ def query_documents(args: argparse.Namespace) -> None:
         filter_tags=filter_tags,
         rescore=getattr(args, "rescore", None),
         oversampling=getattr(args, "oversampling", None),
+        rerank=bool(getattr(args, "rerank", False)),
+        rerank_model=getattr(args, "rerank_model", None),
     )
 
     if not results:
@@ -1185,6 +1298,8 @@ def create_rag_app(
     embed_model: str,
     chat_model: str,
     default_limit: int,
+    default_rerank: bool = False,
+    default_rerank_model: str = DEFAULT_RERANK_MODEL,
 ) -> FastAPI:
     app = FastAPI(title="Tiny RAG Chat API", version="0.1.0")
 
@@ -1202,6 +1317,10 @@ def create_rag_app(
     @app.post("/chat")
     def chat(request: ChatRequest) -> Dict[str, Any]:
         effective_limit = request.limit if request.limit is not None else default_limit
+        effective_rerank = (
+            request.rerank if request.rerank is not None else default_rerank
+        )
+        effective_rerank_model = request.rerank_model or default_rerank_model
         try:
             results, search_mode = search_documents(
                 request.message,
@@ -1214,6 +1333,8 @@ def create_rag_app(
                 filter_source=request.filter_source,
                 filter_source_type=request.filter_source_type,
                 filter_tags=request.filter_tags,
+                rerank=effective_rerank,
+                rerank_model=effective_rerank_model,
             )
             contexts: List[Dict[str, Any]] = []
             for result in results:
@@ -1362,6 +1483,19 @@ def serve_chat_endpoint(args: argparse.Namespace) -> None:
     else:
         print("Hybrid search: disabled (install fastembed to enable).")
 
+    rerank_default = bool(getattr(args, "rerank_default", False))
+    rerank_model = getattr(args, "rerank_model", DEFAULT_RERANK_MODEL)
+    if rerank_default:
+        if _reranker_available():
+            print(f"Reranking: enabled by default (model: {rerank_model}).")
+        else:
+            print(
+                "Reranking: requested by default but fastembed is not "
+                "installed. Falling back to no rerank."
+            )
+    else:
+        print("Reranking: off by default. Pass rerank=true in /chat to enable.")
+
     app = create_rag_app(
         qdrant_url=args.qdrant_url,
         ollama_url=args.ollama_url,
@@ -1369,6 +1503,8 @@ def serve_chat_endpoint(args: argparse.Namespace) -> None:
         embed_model=args.model,
         chat_model=args.chat_model,
         default_limit=args.retrieval_limit,
+        default_rerank=rerank_default,
+        default_rerank_model=rerank_model,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 
@@ -1545,6 +1681,26 @@ def build_parser() -> argparse.ArgumentParser:
             "meaningful on quantized collections."
         ),
     )
+    query_parser.add_argument(
+        "--rerank",
+        dest="rerank",
+        action="store_true",
+        default=False,
+        help=(
+            "Run a cross-encoder reranker on the top candidates as a third "
+            "stage after dense / hybrid retrieval. Gives the biggest recall "
+            "lift on ambiguous queries."
+        ),
+    )
+    query_parser.add_argument(
+        "--rerank-model",
+        dest="rerank_model",
+        default=None,
+        help=(
+            "fastembed cross-encoder model id for reranking. Defaults to "
+            f"'{DEFAULT_RERANK_MODEL}'."
+        ),
+    )
     query_parser.set_defaults(func=query_documents)
 
     traverse_parser = subparsers.add_parser(
@@ -1570,6 +1726,25 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--retrieval-limit", type=int, default=3)
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
+    serve_parser.add_argument(
+        "--rerank-default",
+        dest="rerank_default",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable cross-encoder reranking by default for /chat requests. "
+            "Clients can still override per-request via 'rerank' in the JSON body."
+        ),
+    )
+    serve_parser.add_argument(
+        "--rerank-model",
+        dest="rerank_model",
+        default=DEFAULT_RERANK_MODEL,
+        help=(
+            "Default fastembed cross-encoder model id used for reranking "
+            "(default: %(default)s)."
+        ),
+    )
     serve_parser.set_defaults(func=serve_chat_endpoint)
 
     memory_parser = subparsers.add_parser(

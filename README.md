@@ -7,6 +7,7 @@ This README doubles as a developer tutorial: it walks through the ingestion pipe
 - How to design a Qdrant payload that supports filtering, citation rendering, and idempotent re-ingest.
 - How to expose ingest + retrieval over both an HTTP API and a CLI, sharing one pipeline.
 - How to combine dense embeddings with a BM42 sparse vector and fuse them with Reciprocal Rank Fusion (RRF) for hybrid search.
+- How to add a cross-encoder reranking stage on top of dense / hybrid retrieval to demo recall lift on ambiguous queries.
 ## Architecture
 ```
   user ──▶ GUI / curl ──▶ FastAPI (/chat, /ingest)
@@ -150,6 +151,27 @@ Mode selection:
 - **dense** — used when the collection has no `sparse` config, when `fastembed` isn't installed, or when sparse encoding fails. The query runs against the named `dense` vector with `using="dense"`.
 - **legacy fallback** — if the collection still has the old unnamed-vector schema, `search_documents` issues an unnamespaced dense query so existing data keeps working until you re-ingest.
 A single payload `Filter` (built by `build_filter`) is applied uniformly across both prefetch branches in hybrid mode, so filter semantics don't change with the search mode.
+## Reranking (optional third stage)
+When `rerank=True` is passed to `search_documents`, the function adds a third stage on top of the dense or hybrid retrieval: it fetches a larger candidate pool (`max(limit*5, 25)`), runs each `(query, chunk_text)` pair through a fastembed cross-encoder, and re-orders by the reranker score before truncating to `limit`. The returned `search_mode` becomes `dense+rerank` or `hybrid+rerank` so downstream UIs can show what actually happened, and the per-point `score` field is replaced with the reranker score so the citation card surfaces the value that drove the new ordering.
+The default model is `Xenova/ms-marco-MiniLM-L-6-v2` (~22 MB). Override per-call with `rerank_model=...` or globally with the `RERANK_MODEL` env var. Suggested alternatives surfaced through the same seam:
+- `BAAI/bge-reranker-base` — stronger general-purpose reranker.
+- `jinaai/jina-reranker-v1-tiny-en` — even smaller and faster than MiniLM.
+- `jinaai/jina-reranker-v2-base-multilingual` — multilingual deployments.
+The encoder is cached at module level keyed by model name, so swapping models live (CLI flag, /chat field, or GUI later on) doesn't pay the download/init cost twice for the same model.
+If `fastembed` is not installed the rerank stage silently no-ops — the base mode result is returned unchanged — so demos work the same way regardless of optional dependencies.
+### Three-mode demo (dense → hybrid → hybrid+rerank)
+A quick SA-friendly script that runs the same query against three retrieval profiles. Best on a deliberately ambiguous query so the recall lift is visible:
+```bash
+Q="how do I keep vectors in memory after compression?"
+# 1. Dense-only — force it by running against a collection without sparse,
+#    or just inspect a baseline ordering.
+python app.py query --query "$Q" --limit 3
+# 2. Hybrid (auto-selected if the collection has sparse vectors).
+python app.py query --query "$Q" --limit 3
+# 3. Hybrid + cross-encoder rerank.
+python app.py query --query "$Q" --limit 3 --rerank
+```
+The `Search mode:` line at the top of each result tells you which path actually ran. In the GUI, the same three modes are accessible by toggling the **Rerank with cross-encoder** checkbox (and dropping the sparse vectors from the collection if you want to demo dense-only).
 ## Chunk payload schema
 Every point upserted into Qdrant carries the following payload. Fields beyond the basics are what enable filtering, page-jump UI, and re-ingest by source:
 - `title` — display title (filename stem for uploads, JSON `title` for sample docs)
@@ -191,10 +213,12 @@ python app.py ingest-file PATH [PATH ...] \
 ### `query` — semantic search
 ```bash
 python app.py query --query "…" [--limit 3] [--collection NAME] \
-                    [--rescore | --no-rescore] [--oversampling 2.0]
+                    [--rescore | --no-rescore] [--oversampling 2.0] \
+                    [--rerank] [--rerank-model MODEL_ID]
 ```
-Prints `Search mode: hybrid` or `Search mode: dense` (see [Retrieval](#retrieval-search_documents)) followed by the top results with score, id, title, category, and a text preview.
+Prints `Search mode: …` (one of `dense`, `hybrid`, `dense+rerank`, `hybrid+rerank`) followed by the top results with score, id, title, category, and a text preview.
 `--rescore` / `--no-rescore` and `--oversampling` are passed through as Qdrant `QuantizationSearchParams` and only affect collections that have quantization configured. The recall demo: run the same query first with `--no-rescore` (fast, lower recall), then with `--rescore --oversampling 2.0` (slower, recall close to full precision).
+`--rerank` enables the cross-encoder reranking stage described in [Reranking](#reranking-optional-third-stage). `--rerank-model` overrides the cross-encoder model id (defaults to `Xenova/ms-marco-MiniLM-L-6-v2`). When reranking is active the printed `score` is the cross-encoder score, not the dense / RRF score.
 ### `traverse` — scroll through stored points
 ```bash
 python app.py traverse [--batch-size 4] [--limit 0] [--collection NAME]
@@ -203,9 +227,11 @@ Iterates through every point using Qdrant scroll pagination (no similarity requi
 ### `serve` — run the FastAPI server + GUI
 ```bash
 python app.py serve [--collection NAME] [--chat-model llama3.2] \
-                    [--retrieval-limit 3] [--host 127.0.0.1] [--port 8000]
+                    [--retrieval-limit 3] [--host 127.0.0.1] [--port 8000] \
+                    [--rerank-default] [--rerank-model MODEL_ID]
 ```
 Mounts `/`, `/health`, `/chat`, `/ingest`, and `/docs`. See the HTTP API section below.
+`--rerank-default` makes `/chat` rerank by default; clients can still override per-request via `"rerank": false` in the JSON body. `--rerank-model` sets the default cross-encoder model id used when the request doesn't specify one.
 ### `memory` — collection stats + side-by-side quantization estimate
 ```bash
 python app.py memory [--collection NAME]
@@ -246,9 +272,9 @@ Serves `static/index.html`: an upload card (files, category, tags, chunk size/ov
 ### `POST /chat`
 Request body:
 ```json
-{ "message": "How do I run Qdrant locally?", "limit": 3 }
+{ "message": "How do I run Qdrant locally?", "limit": 3, "rerank": true }
 ```
-`limit` is optional (defaults to `--retrieval-limit`, normally `3`; max `10`).
+`limit` is optional (defaults to `--retrieval-limit`, normally `3`; max `10`). `rerank` is optional too — when omitted the server-side default applies (controlled by `serve --rerank-default`). `rerank_model` (also optional) overrides the cross-encoder model id for that single request. Filter fields (`filter_category`, `filter_source`, `filter_source_type`, `filter_tags`) are also accepted and applied uniformly across the dense and sparse prefetch branches.
 Response:
 ```json
 {
@@ -313,6 +339,7 @@ FastAPI's auto-generated Swagger UI for `/chat` and `/ingest`.
 - `OLLAMA_URL` — default `http://localhost:11434`
 - `OLLAMA_MODEL` — embedding model, default `nomic-embed-text`
 - `OLLAMA_CHAT_MODEL` — generation model used by `serve`, default `llama3.2`
+- `RERANK_MODEL` — fastembed cross-encoder used when `--rerank` (CLI) or `rerank=true` (HTTP) is set; default `Xenova/ms-marco-MiniLM-L-6-v2`.
 CLI flags always override env vars.
 ## Quantization & memory reporting (SA demo flow)
 A short walkthrough that lets a Solutions Architect tell a complete "quality, speed, cost" story end-to-end. It assumes Qdrant + Ollama are running and the venv is active.

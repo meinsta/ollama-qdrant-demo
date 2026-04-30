@@ -184,6 +184,10 @@
           <label for="limit">Retrieval limit</label>
           <input id="limit" type="number" min="1" max="10" value="3" />
         </div>
+        <div class="checkbox-row" style="flex: 1; padding-bottom: 4px;">
+          <input id="rerank" type="checkbox" />
+          <label for="rerank" style="margin: 0;">Rerank with cross-encoder (extra recall, +latency)</label>
+        </div>
         <div class="small" style="flex: 1;">
           Tip: press <span class="kbd">⌘</span>+<span class="kbd">Enter</span> (or <span class="kbd">Ctrl</span>+<span class="kbd">Enter</span>) to send.
         </div>
@@ -244,6 +248,7 @@
     const $ = (id) => document.getElementById(id);
     const messageEl = $("message");
     const limitEl = $("limit");
+    const rerankEl = $("rerank");
     const filterCategoryEl = $("filter-category");
     const filterSourceTypeEl = $("filter-source-type");
     const filterSourceEl = $("filter-source");
@@ -339,6 +344,7 @@
       if (fst) body.filter_source_type = fst;
       if (fs) body.filter_source = fs;
       if (ft && ft.length > 0) body.filter_tags = ft;
+      if (rerankEl && rerankEl.checked) body.rerank = true;
 
       sendEl.disabled = true;
       const oldLabel = sendEl.textContent;
