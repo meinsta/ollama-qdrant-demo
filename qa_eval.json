@@ -1,0 +1,34 @@
+[
+  {
+    "query": "How do I run Qdrant locally with Docker?",
+    "expected_source": "sample:1"
+  },
+  {
+    "query": "What command do I use to pull an embedding model in Ollama?",
+    "expected_source": "sample:2"
+  },
+  {
+    "query": "Describe the typical vector search workflow end to end.",
+    "expected_source": "sample:3"
+  },
+  {
+    "query": "Which distance metric is the common default for text embeddings in Qdrant?",
+    "expected_source": "sample:4"
+  },
+  {
+    "query": "Why should I attach metadata payloads like title and category to every point?",
+    "expected_source": "sample:5"
+  },
+  {
+    "query": "What stack would I use for a local RAG prototype?",
+    "expected_source": "sample:6"
+  },
+  {
+    "query": "How can I traverse every point in a collection without running a similarity search?",
+    "expected_source": "sample:7"
+  },
+  {
+    "query": "What makes retrieval quality better in a RAG system?",
+    "expected_source": "sample:8"
+  }
+]

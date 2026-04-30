@@ -28,9 +28,10 @@ This README doubles as a developer tutorial: it walks through the ingestion pipe
 ```
 The ingest pipeline is shared by three entrypoints — the `ingest` CLI (sample JSON), the `ingest-file` CLI (local PDF/MD/TXT), and the `POST /ingest` endpoint — all of which funnel into `ingest_chunks` in `app.py`. The /chat endpoint and `query` CLI share `search_documents`, which automatically picks hybrid or dense-only retrieval based on what the collection and runtime support.
 ## Project layout
-- `app.py` — single-file CLI + FastAPI app. Subcommands: `ingest`, `ingest-file`, `query`, `traverse`, `serve`, `memory`, `quantize`.
+- `app.py` — single-file CLI + FastAPI app. Subcommands: `ingest`, `ingest-file`, `query`, `traverse`, `serve`, `memory`, `quantize`, `bench`.
 - `static/index.html` — single-file HTML/CSS/JS GUI served by `serve` (upload card + chat box + citations).
 - `sample_data.json` — 8 example documents used by `ingest` (a JSON list of `{id, title, text, category}`).
+- `qa_eval.json` — 8 labeled queries (`{query, expected_source}`) consumed by `bench` for recall@k.
 - `requirements.txt` — Python deps: `qdrant-client`, `requests`, `fastapi`, `uvicorn`, `pydantic`, `pypdf`, `python-multipart`, plus optional `fastembed` (enables hybrid BM42 search).
 Key symbols inside `app.py`, if you want to read along:
 - `extract_pdf_pages`, `extract_chunks_from_bytes` — file → tokens with optional page numbers.
@@ -194,15 +195,17 @@ All commands accept the global flags `--qdrant-url`, `--ollama-url`, and `--mode
 python app.py ingest [--collection NAME] [--data-file PATH] \
                      [--chunk-size 400] [--chunk-overlap 50] \
                      [--quantization {none,scalar,binary,product}] \
-                     [--no-always-ram]
+                     [--no-always-ram] \
+                     [--hnsw-m 16] [--hnsw-ef-construct 100]
 ```
-Drops + recreates the collection, then ingests every document in the data file through the unified chunk pipeline. Override `--data-file` to point at any JSON list of `{id, title, text, category}` objects. `--quantization` (default `none`) is applied at collection-create time. `--always-ram` is on by default so the quantized vectors stay resident in RAM — pass `--no-always-ram` to allow them on disk.
+Drops + recreates the collection, then ingests every document in the data file through the unified chunk pipeline. Override `--data-file` to point at any JSON list of `{id, title, text, category}` objects. `--quantization` (default `none`) is applied at collection-create time. `--always-ram` is on by default so the quantized vectors stay resident in RAM — pass `--no-always-ram` to allow them on disk. `--hnsw-m` and `--hnsw-ef-construct` configure the HNSW graph at create time (see [HNSW tuning](#hnsw-tuning-playground)).
 ### `ingest-file` — chunk + embed local PDF / MD / TXT files
 ```bash
 python app.py ingest-file PATH [PATH ...] \
   [--collection NAME] [--category LABEL] [--tags a,b,c] \
   [--chunk-size 400] [--chunk-overlap 50] [--no-replace] \
-  [--quantization {none,scalar,binary,product}] [--no-always-ram]
+  [--quantization {none,scalar,binary,product}] [--no-always-ram] \
+  [--hnsw-m 16] [--hnsw-ef-construct 100]
 ```
 - The collection is created lazily if it doesn't exist.
 - Existing chunks for the same source filename are replaced by default; pass `--no-replace` to keep them.
@@ -214,11 +217,13 @@ python app.py ingest-file PATH [PATH ...] \
 ```bash
 python app.py query --query "…" [--limit 3] [--collection NAME] \
                     [--rescore | --no-rescore] [--oversampling 2.0] \
-                    [--rerank] [--rerank-model MODEL_ID]
+                    [--rerank] [--rerank-model MODEL_ID] \
+                    [--hnsw-ef 128]
 ```
 Prints `Search mode: …` (one of `dense`, `hybrid`, `dense+rerank`, `hybrid+rerank`) followed by the top results with score, id, title, category, and a text preview.
 `--rescore` / `--no-rescore` and `--oversampling` are passed through as Qdrant `QuantizationSearchParams` and only affect collections that have quantization configured. The recall demo: run the same query first with `--no-rescore` (fast, lower recall), then with `--rescore --oversampling 2.0` (slower, recall close to full precision).
 `--rerank` enables the cross-encoder reranking stage described in [Reranking](#reranking-optional-third-stage). `--rerank-model` overrides the cross-encoder model id (defaults to `Xenova/ms-marco-MiniLM-L-6-v2`). When reranking is active the printed `score` is the cross-encoder score, not the dense / RRF score.
+`--hnsw-ef` overrides Qdrant's per-query HNSW search width (`SearchParams(hnsw_ef=N)`). Higher = better recall, slower; pair it with `--hnsw-m` / `--hnsw-ef-construct` (build-time, on `ingest`) for a complete recall vs latency demo.
 ### `traverse` — scroll through stored points
 ```bash
 python app.py traverse [--batch-size 4] [--limit 0] [--collection NAME]
@@ -262,6 +267,32 @@ python app.py quantize --mode {scalar|binary|product} [--no-always-ram] \
                        [--collection NAME]
 ```
 Calls `client.update_collection(quantization_config=...)` so existing data is re-quantized in the background — no re-ingest required. Use `memory` a few seconds later to verify. To disable quantization entirely, drop the collection (e.g. `python app.py ingest`) and recreate without `--quantization`.
+### `bench` — latency + recall@k against a labeled query set
+```bash
+python app.py bench [--collection NAME] [--queries-file qa_eval.json] \
+                    [--limit 3] [--repeats 5] \
+                    [--hnsw-ef 128] [--rerank] [--rerank-model MODEL_ID] \
+                    [--rescore | --no-rescore] [--oversampling 2.0] \
+                    [--compare-rerank]
+```
+Loads `qa_eval.json` (or any file you pass to `--queries-file`), runs one warmup per config followed by `--repeats` timed runs per query, and prints a one- or two-row table with end-to-end p50/p95/mean latency and recall@`limit`.
+`qa_eval.json` is a JSON list of objects:
+```json
+[
+  { "query": "How do I run Qdrant locally with Docker?", "expected_source": "sample:1" },
+  { "query": "another question", "expected_sources": ["sample:2", "docs.pdf"] }
+]
+```
+`expected_source` (string) and `expected_sources` (list[str]) are both honored — supplying either enables recall@k for that row. Latency is measured around `search_documents`, so it includes the Ollama embed call, the Qdrant query, and (when active) the cross-encoder rerank.
+`--compare-rerank` is a convenience that runs the same bench twice in one CLI call — once with `rerank=False`, once with `rerank=True` — so the table shows both configs side by side. Pair it with `--hnsw-ef` to demo the recall lift of reranking on top of a tighter HNSW search.
+Example output:
+```
+Bench: 8 queries x 5 repeats on 'ollama_demo_docs' (limit=3, hnsw_ef=128).
+  config       mode             runs   p50 (ms)   p95 (ms)  mean (ms)        recall@3
+  ----------------------------------------------------------------------------------
+  no rerank    hybrid             40       42.3       58.1       45.7   87.5% (7/8)
+  rerank       hybrid+rerank      40       72.4       91.7       76.1  100.0% (8/8)
+```
 ## HTTP API reference
 ### `GET /` — browser GUI
 Serves `static/index.html`: an upload card (files, category, tags, chunk size/overlap, replace toggle) and a chat box that renders citations inline. ⌘/Ctrl+Enter sends from the textarea.
@@ -341,6 +372,23 @@ FastAPI's auto-generated Swagger UI for `/chat` and `/ingest`.
 - `OLLAMA_CHAT_MODEL` — generation model used by `serve`, default `llama3.2`
 - `RERANK_MODEL` — fastembed cross-encoder used when `--rerank` (CLI) or `rerank=true` (HTTP) is set; default `Xenova/ms-marco-MiniLM-L-6-v2`.
 CLI flags always override env vars.
+## HNSW tuning playground
+Qdrant's vector index is HNSW. Three knobs matter for the recall vs latency demo, and they all flow through this CLI:
+- `--hnsw-m` (on `ingest` / `ingest-file`) — graph degree at build time. Qdrant default is 16. Higher = better recall and more RAM, slower index build. Applied only when the collection is being created; ignored on existing collections (drop and recreate to change).
+- `--hnsw-ef-construct` (on `ingest` / `ingest-file`) — search width while building the graph. Default 100. Higher = better-quality graph, slower build.
+- `--hnsw-ef` (on `query` / `bench`) — per-query search width. Higher = better recall, slower. This is the knob you usually tune live during a demo since it doesn't require a re-ingest.
+The build-time params hit `models.HnswConfigDiff` on `create_collection`; the per-query param hits `models.SearchParams(hnsw_ef=...)` on `query_points`. Both are wired through `build_hnsw_config` and `build_search_params` in `app.py`, so the same plumbing serves the CLI, the chat endpoint, and the bench harness.
+A quick playground script:
+```bash
+# Baseline: default HNSW (m=16, ef_construct=100), default per-query ef.
+python app.py ingest
+python app.py bench --repeats 5
+# Wider build graph for better recall ceiling.
+python app.py ingest --hnsw-m 32 --hnsw-ef-construct 200
+python app.py bench --repeats 5 --hnsw-ef 128
+# Show the recall lift of reranking on top of a tighter HNSW search.
+python app.py bench --repeats 5 --hnsw-ef 128 --compare-rerank
+```
 ## Quantization & memory reporting (SA demo flow)
 A short walkthrough that lets a Solutions Architect tell a complete "quality, speed, cost" story end-to-end. It assumes Qdrant + Ollama are running and the venv is active.
 ```bash

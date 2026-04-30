@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from qdrant_client import QdrantClient, models
 
 DEFAULT_COLLECTION = "ollama_demo_docs"
 DEFAULT_DATA_FILE = Path(__file__).with_name("sample_data.json")
+DEFAULT_EVAL_FILE = Path(__file__).with_name("qa_eval.json")
 STATIC_DIR = Path(__file__).with_name("static")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -378,22 +380,50 @@ def format_bytes(n: float) -> str:
     return f"{value:.2f} PB"
 
 
-def build_quantization_search_params(
-    rescore: Optional[bool], oversampling: Optional[float]
+def build_search_params(
+    *,
+    rescore: Optional[bool] = None,
+    oversampling: Optional[float] = None,
+    hnsw_ef: Optional[int] = None,
 ) -> Optional[models.SearchParams]:
-    """Construct a SearchParams object that tunes quantized re-scoring.
+    """Construct a SearchParams object covering quantization re-scoring + HNSW ef.
 
-    Returns None when neither knob is provided so callers can omit the
-    ``search_params`` argument entirely on collections without quantization.
+    Returns None when no knob is provided so callers can omit the
+    ``search_params`` argument entirely. ``hnsw_ef`` controls per-query
+    candidate-pool width on the HNSW graph: higher = better recall, slower.
     """
-    if rescore is None and oversampling is None:
+    if rescore is None and oversampling is None and hnsw_ef is None:
         return None
-    return models.SearchParams(
-        quantization=models.QuantizationSearchParams(
+    quantization = None
+    if rescore is not None or oversampling is not None:
+        quantization = models.QuantizationSearchParams(
             rescore=rescore if rescore is not None else True,
             oversampling=oversampling if oversampling is not None else 1.0,
         )
-    )
+    kwargs: Dict[str, Any] = {}
+    if quantization is not None:
+        kwargs["quantization"] = quantization
+    if hnsw_ef is not None:
+        kwargs["hnsw_ef"] = hnsw_ef
+    return models.SearchParams(**kwargs)
+
+
+def build_hnsw_config(
+    m: Optional[int] = None, ef_construct: Optional[int] = None
+) -> Optional[models.HnswConfigDiff]:
+    """Translate CLI HNSW knobs into an HnswConfigDiff applied at create time.
+
+    Returns None when no knob is provided so ``ensure_collection`` falls back
+    to Qdrant's defaults (``m=16``, ``ef_construct=100``).
+    """
+    if m is None and ef_construct is None:
+        return None
+    diff_kwargs: Dict[str, Any] = {}
+    if m is not None:
+        diff_kwargs["m"] = m
+    if ef_construct is not None:
+        diff_kwargs["ef_construct"] = ef_construct
+    return models.HnswConfigDiff(**diff_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -579,13 +609,15 @@ def ensure_collection(
     vector_size: int,
     *,
     quantization_config: Optional[Any] = None,
+    hnsw_config: Optional[models.HnswConfigDiff] = None,
 ) -> None:
     """Create the collection if missing; verify vector size if it already exists.
 
-    ``quantization_config`` is applied only when the collection is being created.
-    For existing collections, use ``python app.py quantize`` to update it in
-    place — a warning is printed when a quantization config is supplied but
-    ignored, so SAs don't silently keep the old setting.
+    ``quantization_config`` and ``hnsw_config`` are applied only when the
+    collection is being created. For existing collections, use
+    ``python app.py quantize`` to update quantization in place — a warning is
+    printed if these knobs are supplied but ignored, so SAs don't silently
+    keep the old setting.
     """
     if client.collection_exists(collection):
         info = client.get_collection(collection)
@@ -616,6 +648,13 @@ def ensure_collection(
                 "this ingest. Run 'python app.py quantize --mode <mode>' to "
                 "change it in place."
             )
+        if hnsw_config is not None:
+            print(
+                f"  note: collection '{collection}' already exists. Ignoring "
+                "--hnsw-m / --hnsw-ef-construct for this ingest. Drop the "
+                "collection (e.g. 'python app.py ingest') to apply new HNSW "
+                "build params."
+            )
         return
 
     sparse_config = (
@@ -630,6 +669,7 @@ def ensure_collection(
         },
         sparse_vectors_config=sparse_config,
         quantization_config=quantization_config,
+        hnsw_config=hnsw_config,
     )
 
     # Keyword payload indexes for efficient filtered search.
@@ -675,6 +715,7 @@ def ingest_chunks(
     replace_existing: bool,
     extra_payload: Optional[Dict[str, Any]] = None,
     quantization_config: Optional[Any] = None,
+    hnsw_config: Optional[models.HnswConfigDiff] = None,
 ) -> int:
     """Embed chunks via Ollama and upsert them into Qdrant with rich payload.
 
@@ -691,6 +732,7 @@ def ingest_chunks(
         collection,
         len(first_vector),
         quantization_config=quantization_config,
+        hnsw_config=hnsw_config,
     )
 
     if replace_existing:
@@ -751,6 +793,7 @@ def ingest_bytes(
     chunk_size: int = DEFAULT_CHUNK_WORDS,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     quantization_config: Optional[Any] = None,
+    hnsw_config: Optional[models.HnswConfigDiff] = None,
 ) -> IngestReport:
     """Top-level helper: bytes -> chunks -> embed -> upsert. Used by HTTP + CLI."""
     chunks, source_type, page_count = extract_chunks_from_bytes(
@@ -789,6 +832,7 @@ def ingest_bytes(
         replace_existing=replace_existing,
         extra_payload={"page_count": page_count} if page_count is not None else None,
         quantization_config=quantization_config,
+        hnsw_config=hnsw_config,
     )
     return IngestReport(
         source=source,
@@ -850,6 +894,7 @@ def search_documents(
     oversampling: Optional[float] = None,
     rerank: bool = False,
     rerank_model: Optional[str] = None,
+    hnsw_ef: Optional[int] = None,
 ) -> Tuple[List[Any], str]:
     """Return (points, search_mode).
 
@@ -876,7 +921,9 @@ def search_documents(
         source_type=filter_source_type,
         tags=filter_tags,
     )
-    search_params = build_quantization_search_params(rescore, oversampling)
+    search_params = build_search_params(
+        rescore=rescore, oversampling=oversampling, hnsw_ef=hnsw_ef
+    )
 
     # When reranking, ask the first stage for more candidates so the
     # cross-encoder has enough material to actually re-order.
@@ -1014,6 +1061,10 @@ def ingest_documents(args: argparse.Namespace) -> None:
     quantization_config = build_quantization_config(
         quantization_mode, always_ram=getattr(args, "always_ram", True)
     )
+    hnsw_config = build_hnsw_config(
+        m=getattr(args, "hnsw_m", None),
+        ef_construct=getattr(args, "hnsw_ef_construct", None),
+    )
 
     total_chunks = 0
     for doc in documents:
@@ -1042,8 +1093,10 @@ def ingest_documents(args: argparse.Namespace) -> None:
             extra_payload={"sample_id": doc["id"]},
             # Only the first ingest call actually creates the collection;
             # subsequent calls hit the existing-collection branch in
-            # ensure_collection and silently ignore quantization_config.
+            # ensure_collection and silently ignore quantization_config /
+            # hnsw_config.
             quantization_config=quantization_config,
+            hnsw_config=hnsw_config,
         )
 
     print(
@@ -1065,6 +1118,10 @@ def ingest_files_command(args: argparse.Namespace) -> None:
     quantization_config = build_quantization_config(
         getattr(args, "quantization", "none"),
         always_ram=getattr(args, "always_ram", True),
+    )
+    hnsw_config = build_hnsw_config(
+        m=getattr(args, "hnsw_m", None),
+        ef_construct=getattr(args, "hnsw_ef_construct", None),
     )
 
     total_chunks = 0
@@ -1094,6 +1151,7 @@ def ingest_files_command(args: argparse.Namespace) -> None:
                 chunk_size=args.chunk_size,
                 chunk_overlap=args.chunk_overlap,
                 quantization_config=quantization_config,
+                hnsw_config=hnsw_config,
             )
         except (ValueError, RuntimeError) as exc:
             print(f"  failed {path.name}: {exc}")
@@ -1135,6 +1193,7 @@ def query_documents(args: argparse.Namespace) -> None:
         oversampling=getattr(args, "oversampling", None),
         rerank=bool(getattr(args, "rerank", False)),
         rerank_model=getattr(args, "rerank_model", None),
+        hnsw_ef=getattr(args, "hnsw_ef", None),
     )
 
     if not results:
@@ -1250,6 +1309,184 @@ def quantize_collection(args: argparse.Namespace) -> None:
         f"Applied {args.mode} quantization (always_ram={args.always_ram}) "
         f"to collection '{args.collection}'. Re-quantization runs in the "
         "background; rerun 'python app.py memory' to verify."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Benchmarking helpers
+# ---------------------------------------------------------------------------
+
+
+def _percentile(values: Sequence[float], p: float) -> float:
+    """Nearest-rank percentile over a list of floats. Returns 0.0 on empty input."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if p <= 0:
+        return ordered[0]
+    if p >= 100:
+        return ordered[-1]
+    rank = max(1, int(round(p / 100.0 * len(ordered))))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def _load_eval_queries(path: Path) -> List[Dict[str, Any]]:
+    """Load and lightly validate a qa_eval.json file.
+
+    Each entry must have a ``query`` field. ``expected_source`` (string) and
+    ``expected_sources`` (list[str]) are both honored — supplying either
+    enables recall@k computation for that row.
+    """
+    if not path.exists():
+        raise RuntimeError(
+            f"Eval queries file not found: {path}. Pass --queries-file to point "
+            "at a different JSON file. See qa_eval.json for an example schema."
+        )
+    with path.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, list):
+        raise ValueError(f"Expected a JSON list at the top of {path}.")
+    out: List[Dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict) or "query" not in entry:
+            raise ValueError(
+                f"Entry #{index} in {path} is missing 'query' or is not an object."
+            )
+        out.append(entry)
+    return out
+
+
+def bench_command(args: argparse.Namespace) -> None:
+    """Run a tiny benchmark over a labeled query set and print latency + recall.
+
+    Each configuration runs one warmup query (to load Ollama embeddings, the
+    sparse encoder, and the optional reranker into RAM) and then ``--repeats``
+    timed runs per query. Latency is end-to-end retrieval cost — it includes
+    embedding the query, the Qdrant call, and the rerank stage when active —
+    so the numbers reflect what an /chat caller actually pays.
+    """
+    queries = _load_eval_queries(Path(args.queries_file))
+    if not queries:
+        raise ValueError("Eval file contains no queries.")
+
+    # Decide which configurations to benchmark in this single CLI invocation.
+    # --compare-rerank is a convenience for the most common SA demo: same
+    # query set, with and without the cross-encoder rerank stage.
+    if args.compare_rerank:
+        configs = [
+            {"label": "no rerank", "rerank": False},
+            {"label": "rerank", "rerank": True},
+        ]
+    else:
+        configs = [
+            {
+                "label": "rerank" if args.rerank else "no rerank",
+                "rerank": bool(args.rerank),
+            }
+        ]
+
+    rows: List[Dict[str, Any]] = []
+    for cfg in configs:
+        latencies: List[float] = []
+        hits = 0
+        scored_queries = 0
+        last_mode: str = ""
+        # Warmup once per config so the first query in the timed loop isn't
+        # skewed by encoder loading.
+        try:
+            search_documents(
+                queries[0]["query"],
+                qdrant_url=args.qdrant_url,
+                ollama_url=args.ollama_url,
+                collection=args.collection,
+                model=args.model,
+                limit=args.limit,
+                rescore=args.rescore,
+                oversampling=args.oversampling,
+                hnsw_ef=args.hnsw_ef,
+                rerank=cfg["rerank"],
+                rerank_model=args.rerank_model,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Bench warmup failed: {exc}") from exc
+
+        for entry in queries:
+            query_text = entry["query"]
+            expected: List[str] = []
+            if isinstance(entry.get("expected_source"), str):
+                expected.append(entry["expected_source"])
+            if isinstance(entry.get("expected_sources"), list):
+                expected.extend(str(s) for s in entry["expected_sources"])
+
+            results: List[Any] = []
+            for _ in range(args.repeats):
+                t0 = time.perf_counter()
+                results, last_mode = search_documents(
+                    query_text,
+                    qdrant_url=args.qdrant_url,
+                    ollama_url=args.ollama_url,
+                    collection=args.collection,
+                    model=args.model,
+                    limit=args.limit,
+                    rescore=args.rescore,
+                    oversampling=args.oversampling,
+                    hnsw_ef=args.hnsw_ef,
+                    rerank=cfg["rerank"],
+                    rerank_model=args.rerank_model,
+                )
+                latencies.append((time.perf_counter() - t0) * 1000.0)
+
+            # Recall@limit: did any of the expected sources appear in the
+            # top-k of the *last* run for this query?
+            if expected:
+                scored_queries += 1
+                top_sources = [
+                    (getattr(r, "payload", None) or {}).get("source")
+                    for r in results
+                ]
+                if any(src in top_sources for src in expected):
+                    hits += 1
+
+        rows.append(
+            {
+                "label": cfg["label"],
+                "mode": last_mode,
+                "runs": len(latencies),
+                "p50": _percentile(latencies, 50),
+                "p95": _percentile(latencies, 95),
+                "mean": (sum(latencies) / len(latencies)) if latencies else 0.0,
+                "hits": hits,
+                "total": scored_queries,
+            }
+        )
+
+    print(
+        f"Bench: {len(queries)} queries x {args.repeats} repeats "
+        f"on '{args.collection}' (limit={args.limit}, hnsw_ef={args.hnsw_ef})."
+    )
+    print()
+    header = (
+        f"  {'config':12s} {'mode':16s} {'runs':>5s} "
+        f"{'p50 (ms)':>10s} {'p95 (ms)':>10s} {'mean (ms)':>10s} "
+        f"{'recall@'+str(args.limit):>14s}"
+    )
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for row in rows:
+        if row["total"] > 0:
+            recall_pct = row["hits"] / row["total"] * 100
+            recall_str = f"{recall_pct:5.1f}% ({row['hits']}/{row['total']})"
+        else:
+            recall_str = "-"
+        print(
+            f"  {row['label']:12s} {row['mode']:16s} "
+            f"{row['runs']:>5d} {row['p50']:>10.1f} {row['p95']:>10.1f} "
+            f"{row['mean']:>10.1f} {recall_str:>14s}"
+        )
+    print()
+    print(
+        "Latency is end-to-end retrieval (embed + search + rerank). "
+        "Recall@k counts queries whose expected_source appears in top-k."
     )
 
 
@@ -1558,6 +1795,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Allow quantized vectors to live on disk.",
     )
+    ingest_parser.add_argument(
+        "--hnsw-m",
+        dest="hnsw_m",
+        type=int,
+        default=None,
+        help=(
+            "HNSW graph degree (Qdrant default: 16). Higher = better recall "
+            "and more RAM, slower index build. Applied at create time."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--hnsw-ef-construct",
+        dest="hnsw_ef_construct",
+        type=int,
+        default=None,
+        help=(
+            "HNSW build-time search width (Qdrant default: 100). Higher = "
+            "better-quality graph at the cost of build time. Applied at "
+            "create time."
+        ),
+    )
     ingest_parser.set_defaults(func=ingest_documents)
 
     ingest_file_parser = subparsers.add_parser(
@@ -1615,6 +1873,27 @@ def build_parser() -> argparse.ArgumentParser:
         dest="always_ram",
         action="store_false",
         help="Allow quantized vectors to live on disk.",
+    )
+    ingest_file_parser.add_argument(
+        "--hnsw-m",
+        dest="hnsw_m",
+        type=int,
+        default=None,
+        help=(
+            "HNSW graph degree applied when this command actually creates "
+            "the collection (Qdrant default: 16). Ignored on existing "
+            "collections — drop the collection to apply."
+        ),
+    )
+    ingest_file_parser.add_argument(
+        "--hnsw-ef-construct",
+        dest="hnsw_ef_construct",
+        type=int,
+        default=None,
+        help=(
+            "HNSW build-time search width (Qdrant default: 100). Same "
+            "create-time-only caveat as --hnsw-m."
+        ),
     )
     ingest_file_parser.set_defaults(replace=True, func=ingest_files_command)
     ingest_file_parser.add_argument(
@@ -1701,6 +1980,17 @@ def build_parser() -> argparse.ArgumentParser:
             f"'{DEFAULT_RERANK_MODEL}'."
         ),
     )
+    query_parser.add_argument(
+        "--hnsw-ef",
+        dest="hnsw_ef",
+        type=int,
+        default=None,
+        help=(
+            "Per-query HNSW search width. Higher = better recall, slower. "
+            "Useful next to --hnsw-m / --hnsw-ef-construct (build-time) for "
+            "a complete recall vs latency demo."
+        ),
+    )
     query_parser.set_defaults(func=query_documents)
 
     traverse_parser = subparsers.add_parser(
@@ -1782,6 +2072,93 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow quantized vectors to live on disk.",
     )
     quantize_parser.set_defaults(func=quantize_collection)
+
+    bench_parser = subparsers.add_parser(
+        "bench",
+        help=(
+            "Run a labeled query set N times and print p50/p95/mean latency "
+            "plus recall@k. The SA enablement artifact for HNSW / quantization "
+            "/ rerank tuning."
+        ),
+    )
+    bench_parser.add_argument("--collection", default=DEFAULT_COLLECTION)
+    bench_parser.add_argument(
+        "--queries-file",
+        dest="queries_file",
+        default=str(DEFAULT_EVAL_FILE),
+        help=(
+            "JSON list of {query, expected_source?} entries. Defaults to "
+            "qa_eval.json next to app.py."
+        ),
+    )
+    bench_parser.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="Top-k size for retrieval and recall@k (default: %(default)s).",
+    )
+    bench_parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+        help=(
+            "How many timed runs per query after the per-config warmup "
+            "(default: %(default)s)."
+        ),
+    )
+    bench_parser.add_argument(
+        "--hnsw-ef",
+        dest="hnsw_ef",
+        type=int,
+        default=None,
+        help="Per-query HNSW ef applied to every run in this bench.",
+    )
+    bench_parser.add_argument(
+        "--rescore",
+        dest="rescore",
+        action="store_true",
+        default=None,
+        help="Same semantics as on 'query'; only meaningful on quantized collections.",
+    )
+    bench_parser.add_argument(
+        "--no-rescore",
+        dest="rescore",
+        action="store_false",
+        help="Skip full-precision re-scoring on quantized collections.",
+    )
+    bench_parser.add_argument(
+        "--oversampling",
+        type=float,
+        default=None,
+        help="Quantization oversampling factor (e.g. 2.0).",
+    )
+    bench_parser.add_argument(
+        "--rerank",
+        dest="rerank",
+        action="store_true",
+        default=False,
+        help="Enable cross-encoder reranking for the bench.",
+    )
+    bench_parser.add_argument(
+        "--rerank-model",
+        dest="rerank_model",
+        default=None,
+        help=(
+            "fastembed cross-encoder model id for reranking. Defaults to "
+            f"'{DEFAULT_RERANK_MODEL}'."
+        ),
+    )
+    bench_parser.add_argument(
+        "--compare-rerank",
+        dest="compare_rerank",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the bench twice in one shot (no-rerank then rerank) so the "
+            "output table shows both side by side."
+        ),
+    )
+    bench_parser.set_defaults(func=bench_command)
 
     return parser
 
