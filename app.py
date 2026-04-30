@@ -1385,6 +1385,31 @@ def _gather_expected(
     return sources, (pages or None)
 
 
+def _wait_for_collection_green(
+    client: QdrantClient, collection: str, timeout_s: float = 30.0
+) -> None:
+    """Poll until ``collection`` reports status=green or ``timeout_s`` elapses.
+
+    ``client.update_collection`` returns as soon as the new config is
+    accepted, but Qdrant re-quantizes existing segments in the background.
+    For repeatable eval numbers we want the optimization step to finish
+    before timing queries; polling status=green is the cheapest signal we
+    have. The timeout is intentionally short — missing it isn't fatal,
+    queries still run, just with possibly mixed segment state.
+    """
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        try:
+            info = client.get_collection(collection)
+            status = getattr(info, "status", None)
+            status_str = getattr(status, "value", None) or str(status)
+            if status_str and status_str.lower() == "green":
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
 def _is_chunk_match(
     point: Any,
     expected_sources: Sequence[str],
@@ -1554,6 +1579,89 @@ def bench_command(args: argparse.Namespace) -> None:
     )
 
 
+def _run_eval_config(
+    args: argparse.Namespace,
+    queries: Sequence[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run warmup + timed loop for one eval config and return a stats row.
+
+    Factored out of ``eval_command`` so the outer quantization-sweep loop
+    in ``eval_command`` can reuse it without duplicating the per-query
+    timing logic.
+    """
+    latencies: List[float] = []
+    hits = 0
+    scored_queries = 0
+    rr_sum = 0.0
+    last_mode: str = ""
+
+    # Warmup once so the first timed query isn't skewed by encoder loading
+    # (Ollama embed, sparse BM42, cross-encoder).
+    try:
+        search_documents(
+            queries[0]["query"],
+            qdrant_url=args.qdrant_url,
+            ollama_url=args.ollama_url,
+            collection=args.collection,
+            model=args.model,
+            limit=args.limit,
+            rescore=cfg["rescore"],
+            oversampling=cfg["oversampling"],
+            hnsw_ef=args.hnsw_ef,
+            rerank=cfg["rerank"],
+            rerank_model=args.rerank_model,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Eval warmup failed: {exc}") from exc
+
+    for entry in queries:
+        query_text = entry["query"]
+        expected_sources, expected_pages = _gather_expected(entry)
+
+        results: List[Any] = []
+        for _ in range(args.repeats):
+            t0 = time.perf_counter()
+            results, last_mode = search_documents(
+                query_text,
+                qdrant_url=args.qdrant_url,
+                ollama_url=args.ollama_url,
+                collection=args.collection,
+                model=args.model,
+                limit=args.limit,
+                rescore=cfg["rescore"],
+                oversampling=cfg["oversampling"],
+                hnsw_ef=args.hnsw_ef,
+                rerank=cfg["rerank"],
+                rerank_model=args.rerank_model,
+            )
+            latencies.append((time.perf_counter() - t0) * 1000.0)
+
+        # Quality metrics use the *last* run's ranking. Recall@k is 1 if
+        # any expected chunk shows up in the top-k; reciprocal rank is
+        # 1/rank of the first match (0 on a miss).
+        if expected_sources or expected_pages:
+            scored_queries += 1
+            hit_rank = 0
+            for rank, point in enumerate(results, start=1):
+                if _is_chunk_match(point, expected_sources, expected_pages):
+                    hit_rank = rank
+                    break
+            if hit_rank:
+                hits += 1
+                rr_sum += 1.0 / hit_rank
+
+    return {
+        "label": cfg["label"],
+        "mode": last_mode,
+        "runs": len(latencies),
+        "mean": (sum(latencies) / len(latencies)) if latencies else 0.0,
+        "hits": hits,
+        "total": scored_queries,
+        "mrr": (rr_sum / scored_queries) if scored_queries else 0.0,
+    }
+
+
 def eval_command(args: argparse.Namespace) -> None:
     """Evaluate retrieval quality on a labeled query set.
 
@@ -1569,6 +1677,11 @@ def eval_command(args: argparse.Namespace) -> None:
         oversampling=2.0; only meaningful on quantized collections)
       - rerank (skipped when ``--no-rerank``)
       - rerank+rescore (when both flags are active)
+
+    When ``--quantize-modes`` is supplied, the entire config grid is run
+    once per requested quantization mode. Each mode is applied in-place
+    via ``client.update_collection`` before its sweep, so SAs can compare
+    recall/MRR across {scalar, binary, product} without re-ingesting.
     """
     queries = _load_eval_queries(Path(args.queries_file))
     if not queries:
@@ -1613,80 +1726,67 @@ def eval_command(args: argparse.Namespace) -> None:
                 }
             )
 
-    rows: List[Dict[str, Any]] = []
-    for cfg in configs:
-        latencies: List[float] = []
-        hits = 0
-        scored_queries = 0
-        rr_sum = 0.0
-        last_mode: str = ""
-
-        # Warmup once per config so the first timed query isn't skewed by
-        # encoder loading (Ollama, sparse BM42, cross-encoder).
-        try:
-            search_documents(
-                queries[0]["query"],
-                qdrant_url=args.qdrant_url,
-                ollama_url=args.ollama_url,
-                collection=args.collection,
-                model=args.model,
-                limit=args.limit,
-                rescore=cfg["rescore"],
-                oversampling=cfg["oversampling"],
-                hnsw_ef=args.hnsw_ef,
-                rerank=cfg["rerank"],
-                rerank_model=args.rerank_model,
+    # Parse and validate the quantization sweep list. Empty/None means
+    # "don't touch the collection—run once with whatever's currently active".
+    quantize_modes_arg = getattr(args, "quantize_modes", None)
+    sweep_modes: List[Optional[str]]
+    if quantize_modes_arg:
+        parsed = [m.strip() for m in quantize_modes_arg.split(",") if m.strip()]
+        bad = [m for m in parsed if m not in ("scalar", "binary", "product")]
+        if bad:
+            raise ValueError(
+                f"Unsupported --quantize-modes value(s): {bad}. "
+                "Choose from scalar, binary, product (in-place updates only)."
             )
-        except Exception as exc:
-            raise RuntimeError(f"Eval warmup failed: {exc}") from exc
+        sweep_modes = list(parsed)
+    else:
+        sweep_modes = [None]
 
-        for entry in queries:
-            query_text = entry["query"]
-            expected_sources, expected_pages = _gather_expected(entry)
+    # Resolve the starting quantization mode so we can report on it later.
+    sweep_client: Optional[QdrantClient] = None
+    initial_mode: Optional[str] = None
+    if quantize_modes_arg:
+        sweep_client = QdrantClient(url=args.qdrant_url)
+        if not sweep_client.collection_exists(args.collection):
+            raise RuntimeError(
+                f"Collection '{args.collection}' does not exist. Ingest first."
+            )
+        try:
+            initial_mode = detect_quantization_mode(
+                sweep_client.get_collection(args.collection)
+            )
+        except Exception:
+            initial_mode = None
 
-            results: List[Any] = []
-            for _ in range(args.repeats):
-                t0 = time.perf_counter()
-                results, last_mode = search_documents(
-                    query_text,
-                    qdrant_url=args.qdrant_url,
-                    ollama_url=args.ollama_url,
-                    collection=args.collection,
-                    model=args.model,
-                    limit=args.limit,
-                    rescore=cfg["rescore"],
-                    oversampling=cfg["oversampling"],
-                    hnsw_ef=args.hnsw_ef,
-                    rerank=cfg["rerank"],
-                    rerank_model=args.rerank_model,
+    rows: List[Dict[str, Any]] = []
+    for q_mode in sweep_modes:
+        if q_mode is not None and sweep_client is not None:
+            print(
+                f"Applying quantization='{q_mode}' to '{args.collection}' "
+                "in-place (always_ram=True)..."
+            )
+            sweep_client.update_collection(
+                collection_name=args.collection,
+                quantization_config=build_quantization_config(
+                    q_mode, always_ram=True
+                ),
+            )
+            _wait_for_collection_green(sweep_client, args.collection)
+            effective_quant = q_mode
+        else:
+            try:
+                effective_quant = detect_quantization_mode(
+                    QdrantClient(url=args.qdrant_url).get_collection(
+                        args.collection
+                    )
                 )
-                latencies.append((time.perf_counter() - t0) * 1000.0)
+            except Exception:
+                effective_quant = "?"
 
-            # Quality metrics use the *last* run's ranking. Recall@k is
-            # 1 if any expected chunk shows up in the top-k; reciprocal
-            # rank is 1/rank of the first match (0 on a miss).
-            if expected_sources or expected_pages:
-                scored_queries += 1
-                hit_rank = 0
-                for rank, point in enumerate(results, start=1):
-                    if _is_chunk_match(point, expected_sources, expected_pages):
-                        hit_rank = rank
-                        break
-                if hit_rank:
-                    hits += 1
-                    rr_sum += 1.0 / hit_rank
-
-        rows.append(
-            {
-                "label": cfg["label"],
-                "mode": last_mode,
-                "runs": len(latencies),
-                "mean": (sum(latencies) / len(latencies)) if latencies else 0.0,
-                "hits": hits,
-                "total": scored_queries,
-                "mrr": (rr_sum / scored_queries) if scored_queries else 0.0,
-            }
-        )
+        for cfg in configs:
+            row = _run_eval_config(args, queries, cfg)
+            row["quantization"] = effective_quant
+            rows.append(row)
 
     print(
         f"Eval: {len(queries)} queries x {args.repeats} repeats "
@@ -1695,7 +1795,7 @@ def eval_command(args: argparse.Namespace) -> None:
     print()
     recall_label = f"recall@{args.limit}"
     header = (
-        f"  {'config':18s} {'mode':16s} {'runs':>5s} "
+        f"  {'config':18s} {'quant':8s} {'mode':16s} {'runs':>5s} "
         f"{'mean (ms)':>10s} {recall_label:>14s} {'MRR':>7s}"
     )
     print(header)
@@ -1709,11 +1809,18 @@ def eval_command(args: argparse.Namespace) -> None:
             recall_str = "-"
             mrr_str = "-"
         print(
-            f"  {row['label']:18s} {row['mode']:16s} "
+            f"  {row['label']:18s} {row['quantization']:8s} {row['mode']:16s} "
             f"{row['runs']:>5d} {row['mean']:>10.1f} "
             f"{recall_str:>14s} {mrr_str:>7s}"
         )
     print()
+    if quantize_modes_arg and initial_mode and initial_mode != sweep_modes[-1]:
+        print(
+            f"Note: collection started in quantization='{initial_mode}' but is "
+            f"now in '{sweep_modes[-1]}'. Run 'python app.py quantize "
+            f"--mode {initial_mode}' (or re-ingest without --quantization to "
+            "reset to none) to restore the previous state."
+        )
     print(
         "MRR = mean of 1/rank for queries whose expected_source[/page] is in "
         "top-k; misses contribute 0. Set expected_page in qa_eval.json for "
@@ -2458,6 +2565,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Also evaluate quantization rescore=True + oversampling=2.0 "
             "variants alongside the default configs (only meaningful on "
             "quantized collections)."
+        ),
+    )
+    eval_parser.add_argument(
+        "--quantize-modes",
+        dest="quantize_modes",
+        default=None,
+        help=(
+            "Comma-separated quantization modes to sweep (e.g. "
+            "'scalar,binary,product'). Each mode is applied in-place via "
+            "update_collection before its config sweep, so the same eval "
+            "runs across multiple compression profiles in one shot. Choices: "
+            "scalar, binary, product. The collection is left in the LAST "
+            "requested mode — the harness prints a 'note' line telling you "
+            "how to restore the original mode if it changed."
         ),
     )
     eval_parser.set_defaults(func=eval_command)

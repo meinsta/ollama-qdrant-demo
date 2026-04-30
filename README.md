@@ -297,10 +297,12 @@ Bench: 8 queries x 5 repeats on 'ollama_demo_docs' (limit=3, hnsw_ef=128).
 ```bash
 python app.py eval [--collection NAME] [--queries-file qa_eval.json] \
                    [--limit 3] [--repeats 3] [--hnsw-ef 128] \
-                   [--rerank-model MODEL_ID] [--no-rerank] [--include-rescore]
+                   [--rerank-model MODEL_ID] [--no-rerank] [--include-rescore] \
+                   [--quantize-modes scalar,binary,product]
 ```
 Where `bench` focuses on latency percentiles, `eval` focuses on retrieval *quality*. It sweeps a small grid of configs against the same query set and reports recall@k, mean reciprocal rank (MRR), and mean end-to-end latency per config.
 Configs evaluated by default: `baseline` (the auto-selected dense / hybrid mode) and `rerank` (cross-encoder on top). `--no-rerank` skips the rerank config; `--include-rescore` adds `baseline+rescore` and (when reranking) `rerank+rescore` variants that pass `rescore=True` + `oversampling=2.0` through to Qdrant — only meaningful on quantized collections.
+`--quantize-modes` accepts a comma-separated list from `{scalar, binary, product}` and runs the entire config grid once per requested mode. Each mode is applied in-place via `client.update_collection` before its sweep, so you get one apples-to-apples table comparing retrieval quality across compression profiles — no re-ingest required. The output table gains a `quant` column. The collection is left in the **last** requested mode; the harness prints a `Note: ...` line at the end with the exact `python app.py quantize --mode <orig>` command needed to restore the previous state. (Note: in-place updates can't switch a collection to `none`; reset by re-ingesting without `--quantization` if needed.)
 **MRR (mean reciprocal rank)** is the average of `1/rank` for the first matching chunk in the top-k across all scored queries; misses contribute 0. Recall@k tells you whether the right chunk is *somewhere* in the top-k; MRR additionally rewards configs that rank it higher. Reranking typically lifts both, but MRR is what moves most when the right chunk was already in top-k but buried at position 3.
 Eval entries support a richer schema than bench:
 ```json
@@ -314,10 +316,29 @@ Eval entries support a richer schema than bench:
 Example output:
 ```
 Eval: 8 queries x 3 repeats on 'ollama_demo_docs' (limit=3, hnsw_ef=128).
-  config             mode             runs  mean (ms)       recall@3     MRR
-  -----------------------------------------------------------------------------
-  baseline           hybrid             24       46.2   87.5% (7/8)   0.792
-  rerank             hybrid+rerank      24       77.8  100.0% (8/8)   0.958
+  config             quant    mode             runs  mean (ms)       recall@3     MRR
+  --------------------------------------------------------------------------------------
+  baseline           none     hybrid             24       46.2   87.5% (7/8)   0.792
+  rerank             none     hybrid+rerank      24       77.8  100.0% (8/8)   0.958
+```
+With `--quantize-modes scalar,binary,product` you get one block of rows per quantization mode, all from a single CLI call:
+```
+Applying quantization='scalar' to 'ollama_demo_docs' in-place (always_ram=True)...
+Applying quantization='binary' to 'ollama_demo_docs' in-place (always_ram=True)...
+Applying quantization='product' to 'ollama_demo_docs' in-place (always_ram=True)...
+Eval: 8 queries x 3 repeats on 'ollama_demo_docs' (limit=3, hnsw_ef=128).
+  config             quant    mode             runs  mean (ms)       recall@3     MRR
+  --------------------------------------------------------------------------------------
+  baseline           scalar   hybrid             24       47.1   87.5% (7/8)   0.781
+  rerank             scalar   hybrid+rerank      24       78.5  100.0% (8/8)   0.958
+  baseline           binary   hybrid             24       45.0   62.5% (5/8)   0.583
+  rerank             binary   hybrid+rerank      24       76.4   87.5% (7/8)   0.844
+  baseline           product  hybrid             24       46.3   75.0% (6/8)   0.667
+  rerank             product  hybrid+rerank      24       77.0   87.5% (7/8)   0.875
+
+Note: collection started in quantization='none' but is now in 'product'. Run
+'python app.py quantize --mode none' (or re-ingest without --quantization to
+reset to none) to restore the previous state.
 ```
 ## HTTP API reference
 ### `GET /` — browser GUI
